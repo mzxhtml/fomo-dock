@@ -15,6 +15,7 @@
     fdRefreshSeconds: 30,
     fdShowPnl: true,
     fdTranslate: false,
+    fdDisplayMode: 'tab',
     fdPanelOpen: {},
     fdPanelPos: {},
   };
@@ -49,6 +50,9 @@
   let settings = { ...DEFAULTS };
   let launcher = null;
   let panel = null;
+  let gmgnButtonHost = null;
+  let gmgnButton = null;
+  let gmgnPreviousTabId = '';
   let activeTab = 'holders';
   let loadedKey = '';
   let loading = false;
@@ -62,6 +66,9 @@
   const pnlCache = new Map();
   let translator = null;
   let translatorPromise = null;
+  let translationRun = 0;
+  const translationCache = new Map();
+  let onchainBalances = { key: '', wallets: new Map(), signature: '' };
   function runtimeMessage(message) {
     return new Promise((resolve) => {
       try {
@@ -128,6 +135,10 @@
   function isOpen() {
     return settings.fdPanelOpen?.[PLATFORM] === true
       || (settings.fdPanelOpen?.[PLATFORM] == null && settings.fdAutoOpen === true);
+  }
+
+  function isEmbeddedMode() {
+    return PLATFORM === 'gmgn' && settings.fdDisplayMode === 'tab';
   }
 
   function saveOpen(open) {
@@ -228,17 +239,124 @@
     return header;
   }
 
+  function holderTokenAmount(item) {
+    const direct = Number(item?.humanAmount);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const found = deepPick(item, /^(human_?amount|token_?amount|amount|balance|quantity|qty|size)$/i, 'number');
+    if (Number.isFinite(found) && found > 0) return found;
+    const usd = Number(item?.value ?? deepPick(item, /(position|value|balance)(usd)?$/i, 'number'));
+    const tokenPrice = Number(item?.priceUsd ?? item?.price
+      ?? deepPick(item, /^(price|price_?usd|token_?price)$/i, 'number'));
+    return usd > 0 && tokenPrice > 0 ? usd / tokenPrice : 0;
+  }
+
+  function refreshOnchainBalances() {
+    if (PLATFORM !== 'gmgn') return false;
+    const route = tokenRoute();
+    if (!route) return false;
+    const key = `${route.chain}|${route.address.toLowerCase()}`;
+    const wallets = onchainBalances.key === key
+      ? new Map(onchainBalances.wallets) : new Map();
+
+    document.querySelectorAll('[data-testid="token-detail-holders-row"]').forEach((row, index) => {
+      const balance = Number(row.getAttribute('data-fd-holder-balance'));
+      if (!Number.isFinite(balance) || balance <= 0) return;
+      const rawAddress = cleanText(row.getAttribute('data-fd-holder-address'), 64);
+      const address = rawAddress.startsWith('0x') ? rawAddress.toLowerCase() : rawAddress;
+      wallets.set(address || `visible-${index}-${balance}`, balance);
+    });
+
+    const signature = [...wallets.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([address, balance]) => `${address}:${balance}`)
+      .join('|');
+    const changed = key !== onchainBalances.key || signature !== onchainBalances.signature;
+    onchainBalances = { key, wallets, signature };
+    return changed;
+  }
+
+  function onchainRank(amount) {
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+    const route = tokenRoute();
+    const key = route ? `${route.chain}|${route.address.toLowerCase()}` : '';
+    if (!key || onchainBalances.key !== key) return null;
+    const balances = [...onchainBalances.wallets.values()].sort((a, b) => b - a);
+    if (!balances.length) return null;
+    const firstNotAbove = balances.findIndex((balance) => balance <= amount);
+    const rank = firstNotAbove < 0 ? balances.length + 1 : firstNotAbove + 1;
+    const exact = amount >= balances[balances.length - 1];
+    return { rank, exact, loaded: balances.length };
+  }
+
+  function buildRankBadge(amount) {
+    const info = onchainRank(amount);
+    if (!info) return null;
+    const badge = document.createElement('span');
+    badge.className = 'fd-rank-badge';
+    if (info.exact) {
+      badge.textContent = `链上#${info.rank}`;
+      badge.classList.toggle('is-top', info.rank <= 10);
+      badge.title = `按持币量估算，在 GMGN 已加载持有者中排第 ${info.rank} 名（已读取 ${info.loaded} 行）`;
+    } else {
+      badge.textContent = `#${info.loaded}+`;
+      badge.classList.add('is-out');
+      badge.title = `持币量低于 GMGN 已加载的 ${info.loaded} 行；滚动持有者列表可提高排名覆盖范围`;
+    }
+    return badge;
+  }
+
+  function syncRankBadges() {
+    panel?.querySelectorAll('.fd-holder[data-fd-holder-amount]').forEach((row) => {
+      const next = buildRankBadge(Number(row.dataset.fdHolderAmount));
+      const current = row.querySelector('.fd-rank-badge');
+      if (!next) {
+        current?.remove();
+        return;
+      }
+      if (current) {
+        current.className = next.className;
+        current.textContent = next.textContent;
+        current.title = next.title;
+        return;
+      }
+      row.querySelector('.fd-item__name')?.insertAdjacentElement('afterend', next);
+    });
+  }
+
+  const PNL_TIERS = [
+    { icon: '💀', label: '重亏' },
+    { icon: '🔴', label: '亏损' },
+    { icon: '⚪', label: '持平' },
+    { icon: '🟢', label: '盈利' },
+    { icon: '🔥', label: '顶级' },
+  ];
+
+  function pnlTier(pnl, equity) {
+    const amountTier = pnl >= 50_000 ? 4 : pnl >= 5_000 ? 3 : pnl > -5_000 ? 2 : pnl > -50_000 ? 1 : 0;
+    if (!(equity > 100)) return amountTier;
+    const rate = pnl / equity * 100;
+    const rateTier = rate >= 30 ? 4 : rate >= 5 ? 3 : rate > -5 ? 2 : rate > -30 ? 1 : 0;
+    return Math.min(amountTier, rateTier);
+  }
+
   function paintPnl(element, response) {
-    const pnl = Number(response?.pnl);
+    const pnl = response?.pnl == null ? NaN : Number(response.pnl);
     element.className = 'fd-pnl-badge';
     if (!response?.ok || !Number.isFinite(pnl)) {
+      element.classList.add('is-none');
       element.textContent = '—';
-      element.title = '暂无 7 日盈亏数据';
+      element.title = response?.reason === 'expired' ? 'FOMO 登录态已过期' : '暂无 7 日盈亏数据';
       return;
     }
-    element.classList.add(pnl >= 0 ? 'is-up' : 'is-down');
-    element.textContent = `${pnl >= 0 ? '+' : ''}${money(pnl) || '$0'}`;
-    element.title = `7 日盈亏 · 组合 ${money(response.equity) || '—'}`;
+    const equity = Number(response.equity) || 0;
+    const tier = pnlTier(pnl, equity);
+    const meta = PNL_TIERS[tier];
+    const rate = equity > 100 ? pnl / equity * 100 : NaN;
+    element.classList.add(`is-t${tier}`, pnl >= 0 ? 'is-up' : 'is-down');
+    element.textContent = `${meta.icon} ${pnl >= 0 ? '+' : ''}${money(pnl) || '$0'}`;
+    element.title = Number.isFinite(rate)
+      ? `${meta.label} · 钱包 7 日盈亏 ${pnl >= 0 ? '+' : ''}${money(pnl)}（${rate > 0 ? '+' : ''}${rate.toFixed(1)}%）· 当前组合 ${money(equity) || '$0'}`
+      : `${meta.label} · 钱包 7 日盈亏 ${pnl >= 0 ? '+' : ''}${money(pnl)}`;
   }
 
   function pumpPnlQueue() {
@@ -265,7 +383,13 @@
   }
 
   function observePnl(element, userId, root) {
-    if (!settings.fdShowPnl || !userId || !('IntersectionObserver' in window)) return;
+    if (!settings.fdShowPnl || !userId) return;
+    element.dataset.fdUserId = String(userId);
+    if (!('IntersectionObserver' in window)) {
+      pnlQueue.push({ element, userId: String(userId) });
+      pumpPnlQueue();
+      return;
+    }
     if (!pnlObserver) {
       pnlObserver = new IntersectionObserver((entries, observer) => {
         for (const entry of entries) {
@@ -276,7 +400,6 @@
         pumpPnlQueue();
       }, { root, rootMargin: '100px' });
     }
-    element.dataset.fdUserId = String(userId);
     pnlObserver.observe(element);
   }
 
@@ -296,22 +419,54 @@
     node.textContent = translated;
   }
 
-  async function translateElement(element) {
-    const raw = element.dataset.fdSource || element.textContent;
-    if (!settings.fdTranslate || !translator || !hasForeignText(raw)) return;
+  async function translatedText(raw) {
+    if (translationCache.has(raw)) return translationCache.get(raw);
     try {
       const translated = cleanText(await translator.translate(raw), 2000);
-      if (translated && translated !== raw && element.isConnected) paintTranslation(element, translated);
+      const result = translated && translated !== raw ? translated : '';
+      translationCache.set(raw, result);
+      while (translationCache.size > 500) translationCache.delete(translationCache.keys().next().value);
+      return result;
     } catch {
-      // Keep the original text when the browser model cannot translate it.
+      return '';
     }
   }
 
-  function translateVisible() {
-    panel?.querySelectorAll('[data-fd-source]').forEach((element) => translateElement(element));
+  async function translateVisible() {
+    const root = panel;
+    if (!root || !settings.fdTranslate || !translator) return;
+    const run = ++translationRun;
+    const targets = [...root.querySelectorAll('[data-fd-source]')]
+      .filter((element) => !element.nextElementSibling?.classList.contains('fd-translation'))
+      .map((element) => ({ element, raw: element.dataset.fdSource || element.textContent }))
+      .filter(({ raw }) => hasForeignText(raw));
+    if (!targets.length) return;
+
+    const results = await Promise.all(targets.map(async ({ element, raw }) => ({
+      element,
+      translated: await translatedText(raw),
+    })));
+    if (run !== translationRun || panel !== root || !settings.fdTranslate) return;
+
+    const list = root.querySelector('.fd-list');
+    const listTop = list?.getBoundingClientRect().top || 0;
+    const anchor = list
+      ? [...list.querySelectorAll('.fd-item')].find((row) => row.getBoundingClientRect().bottom > listTop)
+      : null;
+    const anchorOffset = anchor ? anchor.getBoundingClientRect().top - listTop : 0;
+
+    window.requestAnimationFrame(() => {
+      if (run !== translationRun || panel !== root || !settings.fdTranslate) return;
+      for (const { element, translated } of results) {
+        if (translated && element.isConnected) paintTranslation(element, translated);
+      }
+      if (list && anchor?.isConnected) {
+        list.scrollTop += anchor.getBoundingClientRect().top - listTop - anchorOffset;
+      }
+    });
   }
 
-  function startTranslatorFromGesture() {
+  function startTranslator() {
     const api = globalThis.Translator;
     if (!api?.create) return null;
     if (!translatorPromise) {
@@ -321,12 +476,30 @@
             translator = instance;
             return instance;
           })
-          .catch(() => null);
+          .catch(() => {
+            // A first-time model download may require a user gesture. Leave the
+            // promise retryable so clicking “译” can start it immediately.
+            translatorPromise = null;
+            return null;
+          });
       } catch {
-        translatorPromise = Promise.resolve(null);
+        translatorPromise = null;
+        return null;
       }
     }
     return translatorPromise;
+  }
+
+  function translateWhenReady() {
+    if (!settings.fdTranslate) return;
+    if (translator) {
+      translateVisible();
+      return;
+    }
+    const pending = startTranslator();
+    pending?.then((instance) => {
+      if (instance && settings.fdTranslate) translateVisible();
+    });
   }
 
   function addBodyText(row, text) {
@@ -336,19 +509,22 @@
     body.textContent = text;
     body.dataset.fdSource = text;
     row.appendChild(body);
-    if (settings.fdTranslate && translator) translateElement(body);
   }
 
   function renderHolders(list, values) {
     list.replaceChildren();
     pnlObserver?.disconnect();
     pnlObserver = null;
+    pnlQueue.length = 0;
     if (!values.length) return renderEmpty(list, '暂无持仓者');
 
     for (const item of values.slice(0, 60)) {
       const row = document.createElement('article');
       row.className = 'fd-item fd-holder';
+      row.dataset.fdHolderAmount = String(holderTokenAmount(item));
       const header = buildUserHeader(item);
+      const rank = buildRankBadge(Number(row.dataset.fdHolderAmount));
+      if (rank) header.appendChild(rank);
       const userId = userOf(item)?.id;
       if (settings.fdShowPnl && userId) {
         const badge = document.createElement('span');
@@ -511,9 +687,11 @@
     items = Array.isArray(response.items) ? response.items : [];
     renderStats(response);
     renderItems(list, items, activeTab);
+    translateWhenReady();
   }
 
   function positionPanel() {
+    if (panel?.classList.contains('fd-panel--embedded')) return;
     const position = settings.fdPanelPos?.[PLATFORM];
     if (position && Number.isFinite(position.x) && Number.isFinite(position.y)) {
       panel.style.left = `${Math.max(8, Math.min(window.innerWidth - 160, position.x))}px`;
@@ -567,9 +745,9 @@
     }
   }
 
-  function buildPanel() {
+  function buildPanel(embedded = false) {
     const root = document.createElement('section');
-    root.className = `fd-root fd-panel fd-platform-${PLATFORM}`;
+    root.className = `fd-root fd-panel fd-platform-${PLATFORM}${embedded ? ' fd-panel--embedded' : ''}`;
     root.dataset.platform = PLATFORM;
 
     const bar = document.createElement('header');
@@ -611,12 +789,13 @@
       settings.fdTranslate = !settings.fdTranslate;
       translate.classList.toggle('is-active', settings.fdTranslate);
       // Translator.create 首次下载语言包时必须直接发生在用户点击调用栈中。
-      const pendingTranslator = settings.fdTranslate ? startTranslatorFromGesture() : null;
+      const pendingTranslator = settings.fdTranslate ? startTranslator() : null;
       await chrome.storage.local.set({ fdTranslate: settings.fdTranslate }).catch(() => {});
       if (settings.fdTranslate) {
         await pendingTranslator;
         translateVisible();
       } else {
+        translationRun += 1;
         panel?.querySelectorAll('.fd-translation').forEach((node) => node.remove());
       }
     });
@@ -625,8 +804,22 @@
     external.className = 'fd-external';
     external.target = '_blank';
     external.rel = 'noreferrer';
-    external.textContent = '↗';
-    external.title = '在 FOMO 打开';
+    external.innerHTML = '<span class="fd-external-mark" aria-hidden="true">F</span>';
+    external.title = '在 FOMO 官网打开';
+    external.setAttribute('aria-label', external.title);
+    const displayMode = document.createElement('button');
+    displayMode.type = 'button';
+    displayMode.className = 'fd-display-mode';
+    displayMode.title = embedded ? '切换为浮窗' : '收回到页内';
+    displayMode.setAttribute('aria-label', displayMode.title);
+    displayMode.innerHTML = embedded
+      ? '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="7" width="13" height="12" rx="2"/><path d="M8 7V5h12v11h-3M13 11h4v4M17 11l-5 5"/></svg>'
+      : '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 15h16M12 7v5M9.5 9.5 12 12l2.5-2.5"/></svg>';
+    displayMode.addEventListener('click', () => {
+      settings.fdDisplayMode = embedded ? 'floating' : 'tab';
+      chrome.storage.local.set({ fdDisplayMode: settings.fdDisplayMode }).catch(() => {});
+      syncUi();
+    });
     const fold = document.createElement('button');
     fold.type = 'button';
     fold.className = 'fd-fold';
@@ -644,7 +837,9 @@
       saveOpen(false);
       syncUi();
     });
-    actions.append(translate, external, fold, close);
+    actions.append(translate, external);
+    if (PLATFORM === 'gmgn') actions.append(displayMode);
+    if (!embedded) actions.append(fold, close);
     bar.append(brand, platform, tabs, actions);
 
     const stats = document.createElement('div');
@@ -652,12 +847,163 @@
     const list = document.createElement('div');
     list.className = 'fd-list';
     root.append(bar, stats, list);
-    makeDraggable(bar);
-    syncFoldButton(root);
+    if (!embedded) {
+      makeDraggable(bar);
+      syncFoldButton(root);
+    }
     return root;
   }
 
+  function gmgnTabContext() {
+    const devTab = document.querySelector('[role="tab"][id$="-tab-dev_token"]');
+    if (!devTab?.parentElement) return null;
+    const tabList = devTab.closest('[role="tablist"]') || devTab.parentElement;
+    const devTabItem = devTab.parentElement;
+    const prefix = devTab.id.replace(/-tab-dev_token$/, '');
+    const nativePanels = [...document.querySelectorAll(`[id^="${prefix}-panel-"]`)]
+      .filter((node) => !node.classList.contains('fd-panel--embedded'));
+    const panelParent = nativePanels[0]?.parentElement
+      || document.getElementById(`${prefix}-panel-fomo`)?.parentElement
+      || null;
+    return { devTab, devTabItem, tabList, prefix, nativePanels, panelParent };
+  }
+
+  function restoreGmgnPanels() {
+    document.querySelectorAll('[data-fd-native-panel-hidden]').forEach((nativePanel) => {
+      const original = nativePanel.dataset.fdNativePanelDisplay || '';
+      if (original) nativePanel.style.display = original;
+      else nativePanel.style.removeProperty('display');
+      delete nativePanel.dataset.fdNativePanelHidden;
+      delete nativePanel.dataset.fdNativePanelDisplay;
+    });
+  }
+
+  function hideGmgnPanels(context) {
+    context.nativePanels.forEach((nativePanel) => {
+      if (!nativePanel.dataset.fdNativePanelHidden) {
+        nativePanel.dataset.fdNativePanelHidden = '1';
+        nativePanel.dataset.fdNativePanelDisplay = nativePanel.style.display || '';
+      }
+      nativePanel.style.setProperty('display', 'none', 'important');
+    });
+  }
+
+  function deactivateGmgnButton({ restoreSelection = false } = {}) {
+    restoreGmgnPanels();
+    if (restoreSelection && gmgnPreviousTabId) {
+      const previous = document.getElementById(gmgnPreviousTabId);
+      if (previous?.isConnected) previous.click();
+    }
+    gmgnButtonHost?.remove();
+    gmgnButtonHost = null;
+    gmgnButton?.remove();
+    gmgnButton = null;
+    gmgnPreviousTabId = '';
+  }
+
+  function ensureGmgnButton(context) {
+    if (!gmgnButton?.isConnected) {
+      gmgnButtonHost?.remove();
+      gmgnButtonHost = document.createElement('span');
+      gmgnButtonHost.className = 'fd-root fd-gmgn-entry-host';
+
+      gmgnButton = document.createElement('button');
+      gmgnButton.type = 'button';
+      gmgnButton.id = 'fd-gmgn-entry';
+      gmgnButton.className = 'fd-root fd-gmgn-entry';
+      gmgnButton.setAttribute('aria-controls', `${context.prefix}-panel-fomo`);
+      gmgnButton.setAttribute('aria-pressed', 'false');
+      gmgnButton.title = '打开或关闭 FOMO';
+      gmgnButton.textContent = 'FOMO';
+
+      // GMGN delegates tab interactions from the tab-list container. Keep every
+      // pointer and keyboard event owned by this independent control so opening
+      // FOMO cannot select, focus or otherwise activate a native GMGN tab.
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'touchstart', 'touchend']
+        .forEach((type) => {
+          gmgnButton.addEventListener(type, (event) => event.stopPropagation());
+        });
+      gmgnButton.addEventListener('keydown', (event) => event.stopPropagation());
+      gmgnButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const selected = context.tabList.querySelector('[role="tab"][aria-selected="true"]');
+        if (selected?.id) gmgnPreviousTabId = selected.id;
+        saveOpen(!isOpen());
+        syncUi();
+      });
+      gmgnButtonHost.appendChild(gmgnButton);
+
+      // Insert after the complete native tab item. Putting the button after the
+      // inner role="tab" node would leave it inside GMGN's clickable tab wrapper.
+      context.devTabItem.insertAdjacentElement('afterend', gmgnButtonHost);
+    }
+
+    const { tabList } = context;
+    if (tabList && tabList.dataset.fdGmgnListener !== '1') {
+      tabList.dataset.fdGmgnListener = '1';
+      tabList.addEventListener('click', (event) => {
+        const targetTab = event.target.closest('[role="tab"]');
+        if (!targetTab || !isEmbeddedMode()) return;
+        saveOpen(false);
+        window.setTimeout(() => {
+          restoreGmgnPanels();
+          teardownPanel();
+          gmgnButton?.classList.remove('is-active');
+          gmgnButton?.setAttribute('aria-pressed', 'false');
+        });
+      });
+    }
+  }
+
+  function syncGmgnButton(route) {
+    const context = gmgnTabContext();
+    if (!context) {
+      teardownPanel();
+      return;
+    }
+    ensureGmgnButton(context);
+    if (!isOpen()) {
+      restoreGmgnPanels();
+      if (panel?.classList.contains('fd-panel--embedded')) teardownPanel();
+      gmgnButton.classList.remove('is-active');
+      gmgnButton.setAttribute('aria-pressed', 'false');
+      return;
+    }
+
+    const selectedNativeTab = context.tabList
+      .querySelector('[role="tab"][aria-selected="true"]');
+    if (gmgnPreviousTabId && selectedNativeTab?.id && selectedNativeTab.id !== gmgnPreviousTabId) {
+      saveOpen(false);
+      restoreGmgnPanels();
+      teardownPanel();
+      gmgnButton.classList.remove('is-active');
+      gmgnButton.setAttribute('aria-pressed', 'false');
+      gmgnPreviousTabId = selectedNativeTab.id;
+      return;
+    }
+    if (!gmgnPreviousTabId && selectedNativeTab?.id) gmgnPreviousTabId = selectedNativeTab.id;
+    gmgnButton.classList.add('is-active');
+    gmgnButton.setAttribute('aria-pressed', 'true');
+    hideGmgnPanels(context);
+
+    if (!panel?.classList.contains('fd-panel--embedded') || !panel.isConnected) {
+      teardownPanel();
+      const latestContext = gmgnTabContext();
+      if (!latestContext?.panelParent) return;
+      panel = buildPanel(true);
+      panel.id = `${latestContext.prefix}-panel-fomo`;
+      panel.setAttribute('role', 'region');
+      panel.setAttribute('aria-labelledby', gmgnButton.id);
+      latestContext.panelParent.appendChild(panel);
+      syncRefreshTimer();
+    }
+    panel.querySelector('.fd-external').href = `https://fomo.family/tokens/${FOMO_CHAIN[route.chain] || route.chain}/${encodeURIComponent(route.address)}`;
+    loadData(false);
+  }
+
   function teardownPanel() {
+    translationRun += 1;
     pnlObserver?.disconnect();
     pnlObserver = null;
     panel?.remove();
@@ -685,8 +1031,20 @@
       launcher?.remove();
       launcher = null;
       teardownPanel();
+      deactivateGmgnButton({ restoreSelection: true });
       return;
     }
+
+    if (isEmbeddedMode()) {
+      launcher?.remove();
+      launcher = null;
+      if (panel && !panel.classList.contains('fd-panel--embedded')) teardownPanel();
+      syncGmgnButton(route);
+      return;
+    }
+
+    deactivateGmgnButton({ restoreSelection: true });
+    if (panel?.classList.contains('fd-panel--embedded')) teardownPanel();
 
     if (!launcher) {
       launcher = document.createElement('button');
@@ -725,25 +1083,34 @@
       loadedKey = '';
       teardownPanel();
     }
+    const ranksChanged = refreshOnchainBalances();
+    if (ranksChanged && activeTab === 'holders' && panel && items.length) {
+      syncRankBadges();
+    }
     syncUi();
   }
 
   chrome.storage.local.get(DEFAULTS).then((stored) => {
     settings = { ...DEFAULTS, ...stored };
     currentRouteKey = routeKey();
+    refreshOnchainBalances();
     syncUi();
+    translateWhenReady();
     routeTimer = window.setInterval(checkRoute, 1000);
   }).catch(() => {});
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     let refreshChanged = false;
+    let translateChanged = false;
     for (const [key, change] of Object.entries(changes)) {
       if (key in DEFAULTS) settings[key] = change.newValue ?? DEFAULTS[key];
       if (key === 'fdRefreshSeconds') refreshChanged = true;
+      if (key === 'fdTranslate') translateChanged = true;
       if (key === 'fomoToken') loadedKey = '';
     }
     syncUi();
+    if (translateChanged && settings.fdTranslate) translateWhenReady();
     if (refreshChanged && panel) syncRefreshTimer();
   });
 

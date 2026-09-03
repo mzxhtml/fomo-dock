@@ -76,7 +76,7 @@ elements.openFomo.addEventListener('click', () => {
 elements.resetLayout.addEventListener('click', async () => {
   await chrome.storage.local.set({ fdPanelPos: {}, fdPanelOpen: {} });
   elements.resetLayout.textContent = '已重置';
-  window.setTimeout(() => { elements.resetLayout.textContent = '重置浮窗位置'; }, 1200);
+  window.setTimeout(() => { elements.resetLayout.textContent = '重置显示状态'; }, 1200);
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {

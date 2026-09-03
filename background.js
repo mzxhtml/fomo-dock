@@ -258,14 +258,18 @@ async function fetchUserPnl(userId) {
     const { response } = await authenticatedFetch(path);
     if (!response.ok) return { ok: false, reason: response.status === 401 ? 'expired' : `http-${response.status}` };
     const body = await response.json().catch(() => null);
+    const status = Number(body?.statusCode);
+    if (body?.success === false || (Number.isFinite(status) && status !== 200)) {
+      return { ok: false, reason: status === 401 ? 'expired' : `api-${status || 'error'}` };
+    }
     const rows = (Array.isArray(body?.responseObject) ? body.responseObject : [])
       .filter((row) => Number.isFinite(Number(row?.pnl)))
       .sort((a, b) => Number(a.snapshotId) - Number(b.snapshotId));
     const first = rows[0];
     const last = rows.at(-1);
     const data = rows.length < 2
-      ? { ok: true, pnl: null, equity: Number(first?.equity) || 0 }
-      : { ok: true, pnl: Number(last.pnl) - Number(first.pnl), equity: Number(last.equity) || 0 };
+      ? { ok: true, pnl: null, equity: Number(first?.equity) || 0, points: rows.length }
+      : { ok: true, pnl: Number(last.pnl) - Number(first.pnl), equity: Number(last.equity) || 0, points: rows.length };
     putBounded(pnlCache, id, { at: Date.now(), data }, 400);
     return data;
   } catch (error) {
