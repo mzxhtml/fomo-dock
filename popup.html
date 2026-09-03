@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FOMO Dock</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <div class="mark">F</div>
+        <div>
+          <h1>FOMO Dock</h1>
+          <p>GMGN · DeBot</p>
+        </div>
+        <span id="version"></span>
+      </header>
+
+      <section class="status-card" aria-live="polite">
+        <span id="status-dot" class="status-dot"></span>
+        <div>
+          <strong id="status-title">正在检查登录态…</strong>
+          <p id="status-note"></p>
+        </div>
+      </section>
+
+      <section class="settings">
+        <label class="switch-row">
+          <span><strong>启用 FOMO Dock</strong><small>在支持的代币页显示入口</small></span>
+          <input id="enabled" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span><strong>进入代币页自动打开</strong><small>GMGN 和 DeBot 分别记忆开关状态</small></span>
+          <input id="auto-open" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span><strong>显示用户 7 日盈亏</strong><small>仅在持仓者行滚动到可见时请求</small></span>
+          <input id="show-pnl" type="checkbox" />
+        </label>
+        <label class="select-row">
+          <span><strong>自动刷新</strong><small>最短 15 秒</small></span>
+          <select id="refresh-seconds">
+            <option value="15">15 秒</option>
+            <option value="30">30 秒</option>
+            <option value="60">1 分钟</option>
+            <option value="120">2 分钟</option>
+            <option value="300">5 分钟</option>
+          </select>
+        </label>
+      </section>
+
+      <div class="actions">
+        <button id="open-fomo" class="primary" type="button">打开 FOMO 登录</button>
+        <button id="reset-layout" type="button">重置浮窗位置</button>
+      </div>
+
+      <p class="privacy">登录令牌只保存在本机，并只发送给 FOMO 官方 API。</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
