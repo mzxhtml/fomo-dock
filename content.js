@@ -10,7 +10,6 @@
 
   const DEFAULTS = {
     fdEnabled: true,
-    fdAutoOpen: false,
     fdFolded: false,
     fdRefreshSeconds: 30,
     fdShowPnl: true,
@@ -138,8 +137,7 @@
   }
 
   function isOpen() {
-    return settings.fdPanelOpen?.[PLATFORM] === true
-      || (settings.fdPanelOpen?.[PLATFORM] == null && settings.fdAutoOpen === true);
+    return settings.fdPanelOpen?.[PLATFORM] === true;
   }
 
   function isEmbeddedMode() {

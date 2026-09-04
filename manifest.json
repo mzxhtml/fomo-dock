@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FOMO Dock",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "在 GMGN 与 DeBot 代币页查看 FOMO 持仓者、观点与交易。",
   "minimum_chrome_version": "111",
   "permissions": [
@@ -13,7 +13,9 @@
     "https://debot.ai/*",
     "https://fomo.family/*",
     "https://*.fomo.family/*",
-    "https://prod-api.fomo.family/*"
+    "https://prod-api.fomo.family/*",
+    "https://985monitor.xyz/*",
+    "https://*.985monitor.xyz/*"
   ],
   "action": {
     "default_title": "FOMO Dock",
@@ -55,15 +57,38 @@
     },
     {
       "matches": [
+        "https://985monitor.xyz/*",
+        "https://*.985monitor.xyz/*"
+      ],
+      "js": [
+        "monitor-auth.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://debot.ai/*"
+      ],
+      "js": [
+        "feed-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "https://gmgn.ai/*",
         "https://debot.ai/*"
       ],
       "css": [
         "theme.css",
-        "styles.css"
+        "styles.css",
+        "feed.css"
       ],
       "js": [
-        "content.js"
+        "content.js",
+        "feed-content.js"
       ],
       "run_at": "document_idle"
     }

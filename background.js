@@ -8,22 +8,181 @@ const CACHE_TTL_MS = 20_000;
 const CACHE_LIMIT = 80;
 const REFRESH_AHEAD_MS = 20 * 60_000;
 
-// 清理由已撤销的 985monitor 推送混排版本写入的设置与只读会话。
-chrome.storage.local.remove([
-  'fdFeedEnabled',
-  'fdFeedChainOnly',
-  'fdFeedTypes',
-  'monitor985SessionV1',
-  'monitor985ClientIdV1',
-  'monitor985SyncStateV1',
-  'monitorFomoConfig',
-]).catch(() => {});
-
 const responseCache = new Map();
 const pnlCache = new Map();
 let keepAliveAt = 0;
 let refreshInFlight = null;
 let sessionOwnerQueue = Promise.resolve();
+
+// 985monitor 只向扩展签发读取 FOMO 推送的只读会话。
+const MONITOR985_ORIGIN = 'https://www.985monitor.xyz';
+const MONITOR985_CONFIG_URL = `${MONITOR985_ORIGIN}/api/extension/config`;
+const FOMO_FEED_URL = `${MONITOR985_ORIGIN}/api/extension/fomo-events?limit=150`;
+const MONITOR985_CONFIG_TTL_MS = 3 * 60_000;
+const FOMO_FEED_MIN_INTERVAL_MS = 15_000;
+const FOMO_FEED_KEEP = 150;
+const FOMO_FEED_TYPE = {
+  FOMO_BUY: 'buy', FOMO_SELL: 'sell', FOMO_SWAP: 'swap', FOMO_THESIS: 'thesis',
+  FOMO_TRANSFER_IN: 'transferIn', FOMO_REFUND: 'refund',
+};
+const FOMO_CHAIN_SLUG = {
+  bnb: 'bsc', bsc: 'bsc', sol: 'sol', solana: 'sol', eth: 'eth', ethereum: 'eth',
+  base: 'base', robinhood: 'robinhood', 'chain 143': 'monad', monad: 'monad',
+};
+let monitor985ConfigInflight = null;
+let fomoFeedCache = { events: [], updatedAt: 0, fetchedAt: 0 };
+let fomoFeedEtag = '';
+let fomoFeedFailCount = 0;
+let fomoFeedBackoffUntil = 0;
+let fomoFeedInflight = null;
+
+async function monitor985Session() {
+  const { monitor985SessionV1: session } = await chrome.storage.local.get({ monitor985SessionV1: null });
+  if (!session?.token || Number(session.expiresAt) <= Date.now()) return null;
+  return session;
+}
+
+function resetFomoFeedCache() {
+  fomoFeedCache = { events: [], updatedAt: 0, fetchedAt: 0 };
+  fomoFeedEtag = '';
+  fomoFeedFailCount = 0;
+  fomoFeedBackoffUntil = 0;
+}
+
+async function markMonitor985Disconnected(reason, clearSession = false) {
+  resetFomoFeedCache();
+  const patch = {
+    monitorFomoConfig: { connected: false, at: Date.now() },
+    monitor985SyncStateV1: { connected: false, reason, checkedAt: Date.now() },
+  };
+  if (clearSession) patch.monitor985SessionV1 = null;
+  await chrome.storage.local.set(patch);
+}
+
+async function applyMonitor985Config(config, session) {
+  if (!config?.connected || !config?.account?.userId) return false;
+  const at = Date.now();
+  await chrome.storage.local.set({
+    monitorFomoConfig: {
+      ...(config.fomo || {}), wallet: config.account.userId,
+      connected: true, revision: config.revision, at,
+    },
+    monitor985SyncStateV1: {
+      connected: true,
+      accountId: config.account.userId,
+      displayName: String(config.account.displayName || ''),
+      syncedAt: at,
+      expiresAt: Number(session?.expiresAt || config.sessionExpiresAt) || 0,
+    },
+  });
+  return true;
+}
+
+async function refreshMonitor985Config(force = false) {
+  if (monitor985ConfigInflight) return monitor985ConfigInflight;
+  monitor985ConfigInflight = (async () => {
+    const stored = await chrome.storage.local.get({ monitor985SessionV1: null, monitor985SyncStateV1: null });
+    const session = stored.monitor985SessionV1;
+    if (!session?.token || Number(session.expiresAt) <= Date.now()) {
+      await markMonitor985Disconnected('login-required', Boolean(session));
+      return false;
+    }
+    if (!force && stored.monitor985SyncStateV1?.connected
+      && Date.now() - Number(stored.monitor985SyncStateV1.syncedAt) < MONITOR985_CONFIG_TTL_MS) return true;
+    try {
+      const response = await fetch(MONITOR985_CONFIG_URL, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${session.token}` },
+        cache: 'no-store',
+      });
+      const body = await response.json().catch(() => null);
+      if (response.status === 401) {
+        await markMonitor985Disconnected('unauthorized', true);
+        return false;
+      }
+      if (!response.ok || body?.ok !== true || !body?.config) throw new Error(`HTTP ${response.status}`);
+      return applyMonitor985Config(body.config, session);
+    } catch {
+      return Boolean(stored.monitor985SyncStateV1?.connected);
+    }
+  })().finally(() => { monitor985ConfigInflight = null; });
+  return monitor985ConfigInflight;
+}
+
+function slimFomoEvent(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const type = FOMO_FEED_TYPE[String(raw.eventType || '')];
+  if (!type) return null;
+  const ts = Number(raw.ts) || Date.parse(raw.createdAt || '') || 0;
+  if (!ts) return null;
+  const chainName = String(raw.chainName || '').trim();
+  const content = raw.content && typeof raw.content === 'object' ? raw.content : {};
+  return {
+    key: String(raw.key || '').slice(0, 120), source: 'fomo', type,
+    handle: String(raw.handle || '').toLowerCase().slice(0, 64),
+    name: String(raw.userName || raw.handle || '').slice(0, 48),
+    avatar: String(raw.avatar || '').slice(0, 300),
+    usd: Number(raw.usd) || 0,
+    comment: String(raw.comment || content.comment || content.text
+      || (type === 'refund' ? `链上交易失败 · ${String(raw.failReason || '已退款')}` : '')).slice(0, 1500),
+    addr: String(raw.tokenAddress || '').slice(0, 96),
+    chain: FOMO_CHAIN_SLUG[chainName.toLowerCase()] || chainName.toLowerCase(),
+    chainName, symbol: String(raw.symbol || '').slice(0, 24),
+    img: String(raw.tokenImage || '').slice(0, 300), mc: Number(raw.marketCap) || 0, ts,
+    tx: String(raw.txHash || raw.transactionHash || raw.transaction_hash
+      || content.txHash || content.transactionHash || content.transaction_hash || '').trim().slice(0, 180),
+  };
+}
+
+async function fetchFomoFeed() {
+  if (fomoFeedInflight) return fomoFeedInflight;
+  const session = await monitor985Session();
+  if (!session) return { ok: false, reason: 'not-connected', events: [] };
+  await refreshMonitor985Config(false);
+  const now = Date.now();
+  if (now - fomoFeedCache.fetchedAt < FOMO_FEED_MIN_INTERVAL_MS || now < fomoFeedBackoffUntil) {
+    return { ok: true, ...fomoFeedCache, stale: true };
+  }
+  fomoFeedInflight = (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 25_000);
+      const headers = { Authorization: `Bearer ${session.token}` };
+      if (fomoFeedEtag) headers['If-None-Match'] = fomoFeedEtag;
+      let response;
+      try {
+        response = await fetch(FOMO_FEED_URL, { headers, cache: 'no-store', signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (response.status === 304) {
+        fomoFeedCache.fetchedAt = Date.now();
+        fomoFeedFailCount = 0;
+        return { ok: true, ...fomoFeedCache };
+      }
+      if (response.status === 401) {
+        await markMonitor985Disconnected('unauthorized', true);
+        return { ok: false, reason: 'not-connected', events: [] };
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body = await response.json();
+      const events = (Array.isArray(body?.events) ? body.events : [])
+        .map(slimFomoEvent).filter(Boolean).sort((a, b) => b.ts - a.ts).slice(0, FOMO_FEED_KEEP);
+      fomoFeedCache = { events, updatedAt: Number(body?.updatedAt) || Date.now(), fetchedAt: Date.now() };
+      fomoFeedEtag = response.headers.get('ETag') || '';
+      fomoFeedFailCount = 0;
+      fomoFeedBackoffUntil = 0;
+      return { ok: true, ...fomoFeedCache };
+    } catch (error) {
+      fomoFeedFailCount += 1;
+      fomoFeedBackoffUntil = Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** (fomoFeedFailCount - 1));
+      if (fomoFeedCache.events.length) return { ok: true, ...fomoFeedCache, stale: true };
+      return { ok: false, reason: 'fetch-failed', message: String(error?.message || '').slice(0, 120) };
+    } finally {
+      fomoFeedInflight = null;
+    }
+  })();
+  return fomoFeedInflight;
+}
 
 function jwtExpiry(token) {
   try {
@@ -332,9 +491,13 @@ async function recordHeartbeat(message, sender) {
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 5 });
   dedupeKeeperTabs().catch(() => {});
+  const previous = String(details?.previousVersion || '0.0.0').split('.').map(Number);
+  if (details?.reason === 'install' || previous[0] < 1 && previous[1] < 3) {
+    chrome.storage.local.set({ fdFeedEnabled: false }).catch(() => {});
+  }
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -347,6 +510,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === '985-monitor-session-updated') {
+    resetFomoFeedCache();
+    refreshMonitor985Config(true)
+      .then((ok) => sendResponse({ ok: Boolean(ok) }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+  if (message?.type === 'fomo-feed') {
+    fetchFomoFeed().then(sendResponse).catch((error) => {
+      sendResponse({ ok: false, reason: 'error', message: String(error?.message || '') });
+    });
+    return true;
+  }
   if (message?.type === 'fomo-page-heartbeat') {
     recordHeartbeat(message, sender).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
     return true;
@@ -382,3 +558,7 @@ chrome.alarms.get(KEEPALIVE_ALARM).then((alarm) => {
 // A service worker can start after Chrome has restored several stale pinned
 // keepers. Remove duplicates immediately without creating a new page.
 dedupeKeeperTabs().catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.monitor985SessionV1) resetFomoFeedCache();
+});

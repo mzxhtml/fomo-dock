@@ -31,12 +31,12 @@
           <input id="enabled" type="checkbox" />
         </label>
         <label class="switch-row">
-          <span><strong>进入代币页自动打开</strong><small>GMGN 和 DeBot 分别记忆开关状态</small></span>
-          <input id="auto-open" type="checkbox" />
-        </label>
-        <label class="switch-row">
           <span><strong>显示用户 7 日盈亏</strong><small>仅在持仓者行滚动到可见时请求</small></span>
           <input id="show-pnl" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span><strong>FOMO 推送混排</strong><small id="feed-note">默认关闭；按时间插入 GMGN / DeBot 追踪流</small></span>
+          <input id="feed-enabled" type="checkbox" />
         </label>
         <label class="select-row">
           <span><strong>自动刷新</strong><small>最短 15 秒</small></span>
@@ -52,10 +52,11 @@
 
       <div class="actions">
         <button id="open-fomo" class="primary" type="button">打开 FOMO 登录</button>
+        <button id="open-monitor" type="button">连接 985monitor</button>
         <button id="reset-layout" type="button">重置显示状态</button>
       </div>
 
-      <p class="privacy">登录令牌只保存在本机，并只发送给 FOMO 官方 API。</p>
+      <p class="privacy">令牌只保存在本机；混排使用 985monitor 签发的只读会话。</p>
     </main>
     <script src="popup.js"></script>
   </body>

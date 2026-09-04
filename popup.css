@@ -129,6 +129,7 @@ button {
 select { padding: 6px 8px; font-size: 11px; }
 
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.actions button:last-child { grid-column: 1 / -1; }
 button { padding: 9px 10px; font-size: 11px; cursor: pointer; }
 button:hover { border-color: rgba(245, 184, 61, 0.5); }
 button.primary { border-color: rgba(245, 184, 61, 0.42); color: #f5b83d; background: rgba(245, 184, 61, 0.1); }

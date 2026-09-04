@@ -2,20 +2,22 @@
 
 const DEFAULTS = {
   fdEnabled: true,
-  fdAutoOpen: false,
   fdShowPnl: true,
   fdRefreshSeconds: 30,
+  fdFeedEnabled: false,
 };
 
 const elements = {
   enabled: document.querySelector('#enabled'),
-  autoOpen: document.querySelector('#auto-open'),
   showPnl: document.querySelector('#show-pnl'),
+  feedEnabled: document.querySelector('#feed-enabled'),
+  feedNote: document.querySelector('#feed-note'),
   refresh: document.querySelector('#refresh-seconds'),
   statusDot: document.querySelector('#status-dot'),
   statusTitle: document.querySelector('#status-title'),
   statusNote: document.querySelector('#status-note'),
   openFomo: document.querySelector('#open-fomo'),
+  openMonitor: document.querySelector('#open-monitor'),
   resetLayout: document.querySelector('#reset-layout'),
   version: document.querySelector('#version'),
 };
@@ -41,26 +43,37 @@ function renderSession(token) {
   elements.statusNote.textContent = formatExpiry(token.exp);
 }
 
+function renderMonitor(state) {
+  const connected = state?.connected === true;
+  elements.feedNote.textContent = connected
+    ? `已连接 ${state.displayName || '985monitor'}；按网页关注与屏蔽配置过滤`
+    : '默认关闭；开启前请先登录一次 985monitor';
+  elements.openMonitor.textContent = connected ? '打开 985monitor' : '连接 985monitor';
+}
+
 async function init() {
-  const stored = await chrome.storage.local.get({ ...DEFAULTS, fomoToken: null });
+  const stored = await chrome.storage.local.get({
+    ...DEFAULTS, fomoToken: null, monitor985SyncStateV1: null,
+  });
   elements.enabled.checked = stored.fdEnabled;
-  elements.autoOpen.checked = stored.fdAutoOpen;
   elements.showPnl.checked = stored.fdShowPnl;
+  elements.feedEnabled.checked = stored.fdFeedEnabled;
   elements.refresh.value = String(stored.fdRefreshSeconds);
   elements.version.textContent = `v${chrome.runtime.getManifest().version}`;
   renderSession(stored.fomoToken);
+  renderMonitor(stored.monitor985SyncStateV1);
 }
 
 elements.enabled.addEventListener('change', () => {
   chrome.storage.local.set({ fdEnabled: elements.enabled.checked });
 });
 
-elements.autoOpen.addEventListener('change', () => {
-  chrome.storage.local.set({ fdAutoOpen: elements.autoOpen.checked });
-});
-
 elements.showPnl.addEventListener('change', () => {
   chrome.storage.local.set({ fdShowPnl: elements.showPnl.checked });
+});
+
+elements.feedEnabled.addEventListener('change', () => {
+  chrome.storage.local.set({ fdFeedEnabled: elements.feedEnabled.checked });
 });
 
 
@@ -70,6 +83,10 @@ elements.refresh.addEventListener('change', () => {
 
 elements.openFomo.addEventListener('click', () => {
   chrome.tabs.create({ url: 'https://fomo.family/' });
+});
+
+elements.openMonitor.addEventListener('click', () => {
+  chrome.tabs.create({ url: 'https://www.985monitor.xyz/' });
 });
 
 
@@ -82,6 +99,7 @@ elements.resetLayout.addEventListener('click', async () => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.fomoToken) renderSession(changes.fomoToken.newValue);
+  if (changes.monitor985SyncStateV1) renderMonitor(changes.monitor985SyncStateV1.newValue);
 });
 
 init().catch(() => {
