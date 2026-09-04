@@ -230,20 +230,6 @@
 .fd-feed-login--sidebar { min-width: 0; }
 .fd-feed-login:hover { background: color-mix(in srgb, var(--bg-page, #111419) 93%, #f5b83d); }
 
-.fd-feed-login__mark {
-  display: grid;
-  flex: 0 0 32px;
-  width: 32px;
-  height: 32px;
-  margin-right: 10px;
-  place-items: center;
-  border-radius: 9px;
-  color: #15171b;
-  background: #f5b83d;
-  font-size: 16px;
-  font-weight: 900;
-}
-
 .fd-feed-login__copy {
   display: flex;
   flex: 1 1 auto;

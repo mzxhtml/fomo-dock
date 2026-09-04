@@ -23,16 +23,10 @@ main { padding: 16px; }
 }
 
 .mark {
-  display: grid;
   width: 38px;
   height: 38px;
-  place-items: center;
   border-radius: 12px;
-  color: #111318;
-  background: #f5b83d;
   box-shadow: 0 9px 24px rgba(245, 184, 61, 0.2);
-  font-size: 20px;
-  font-weight: 900;
 }
 
 h1 { margin: 0; font-size: 16px; }

@@ -7,6 +7,7 @@
   const PLATFORM = location.hostname === 'debot.ai' ? 'debot'
     : location.hostname === 'gmgn.ai' ? 'gmgn' : '';
   if (!PLATFORM) return;
+  const ICON_URL = chrome.runtime.getURL('icons/icon32.png');
 
   const DEFAULTS = {
     fdEnabled: true,
@@ -858,7 +859,10 @@
     bar.className = 'fd-bar';
     const brand = document.createElement('strong');
     brand.className = 'fd-brand';
-    brand.textContent = 'FOMO Dock';
+    const brandIcon = document.createElement('img');
+    brandIcon.src = ICON_URL;
+    brandIcon.alt = '';
+    brand.append(brandIcon, document.createTextNode('FOMO Dock'));
     const platform = document.createElement('span');
     platform.className = 'fd-platform';
     platform.textContent = PLATFORM === 'debot' ? 'DeBot' : 'GMGN';
@@ -1324,7 +1328,12 @@
       launcher = document.createElement('button');
       launcher.type = 'button';
       launcher.className = `fd-root fd-launcher fd-platform-${PLATFORM}`;
-      launcher.innerHTML = '<span>F</span><b>FOMO</b>';
+      const launcherIcon = document.createElement('img');
+      launcherIcon.src = ICON_URL;
+      launcherIcon.alt = '';
+      const launcherLabel = document.createElement('b');
+      launcherLabel.textContent = 'FOMO';
+      launcher.append(launcherIcon, launcherLabel);
       launcher.title = '打开 FOMO Dock';
       launcher.addEventListener('click', () => {
         saveOpen(!isOpen());

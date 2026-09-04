@@ -36,16 +36,11 @@
   transform: translateY(-1px);
 }
 
-.fd-launcher span {
-  display: grid;
+.fd-launcher img {
   width: 30px;
   height: 30px;
-  place-items: center;
-  border-radius: 50%;
-  color: #111318;
-  background: var(--fd-accent);
-  font-size: 16px;
-  font-weight: 900;
+  flex: none;
+  border-radius: 9px;
 }
 
 .fd-launcher b {
@@ -173,9 +168,18 @@
 }
 
 .fd-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--fd-accent);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.fd-brand img {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
 }
 
 .fd-platform {

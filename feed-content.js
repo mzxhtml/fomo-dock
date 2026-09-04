@@ -89,9 +89,6 @@
     prompt.className = `fd-feed-login fd-feed-login--${variant}`;
     prompt.dataset.fdFeedOwned = '1';
     prompt.setAttribute('role', 'status');
-    const mark = document.createElement('span');
-    mark.className = 'fd-feed-login__mark';
-    mark.textContent = 'F';
     const copy = document.createElement('div');
     copy.className = 'fd-feed-login__copy';
     const title = document.createElement('strong');
@@ -115,7 +112,7 @@
       loginPromptDismissed = true;
       scheduleRender();
     });
-    prompt.append(mark, copy, connect, close);
+    prompt.append(copy, connect, close);
     return prompt;
   }
 
