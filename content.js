@@ -60,6 +60,9 @@
   let loading = false;
   let items = [];
   let refreshTimer = 0;
+  let refreshResumeTimer = 0;
+  let refreshPaused = false;
+  let refreshPending = false;
   let routeTimer = 0;
   let currentRouteKey = '';
   let pnlObserver = null;
@@ -729,21 +732,35 @@
     list.appendChild(guide);
   }
 
-  async function loadData(force = false) {
+  async function loadData(force = false, source = 'normal') {
     const route = tokenRoute();
     if (!route || !panel || loading) return;
+    const backgroundRefresh = source === 'auto' || source === 'resume';
+    if (source === 'auto' && refreshPaused) {
+      refreshPending = true;
+      syncRefreshPauseIndicator();
+      return;
+    }
     const key = `${activeTab}|${routeKey(route)}`;
     if (!force && loadedKey === key) return;
     loading = true;
     const list = panel.querySelector('.fd-list');
-    list.replaceChildren();
-    renderEmpty(list, '加载中…');
+    if (!backgroundRefresh || !list.children.length) {
+      list.replaceChildren();
+      renderEmpty(list, '加载中…');
+    }
     const response = await runtimeMessage({
       type: 'fomo-token-feed',
       payload: { tokenAddress: route.address, networkId: route.networkId, kind: activeTab },
     });
     loading = false;
-    if (!panel || routeKey() !== routeKey(route)) return;
+    if (!panel || routeKey() !== routeKey(route)
+      || `${activeTab}|${routeKey(route)}` !== key) return;
+    if (source === 'auto' && refreshPaused) {
+      refreshPending = true;
+      syncRefreshPauseIndicator();
+      return;
+    }
     if (!response?.ok) return showError(list, response);
     loadedKey = key;
     items = Array.isArray(response.items) ? response.items : [];
@@ -807,6 +824,33 @@
     }
   }
 
+  function syncRefreshPauseIndicator(root = panel) {
+    if (!root) return;
+    root.classList.toggle('is-refresh-paused', refreshPaused);
+    const indicator = root.querySelector('.fd-refresh-pause');
+    if (!indicator) return;
+    const label = refreshPending
+      ? '自动刷新已暂停，移开鼠标后立即更新'
+      : '鼠标悬停中，自动刷新已暂停';
+    indicator.title = label;
+    indicator.setAttribute('aria-label', label);
+  }
+
+  function setRefreshPaused(paused, root = panel) {
+    if (refreshResumeTimer) window.clearTimeout(refreshResumeTimer);
+    refreshResumeTimer = 0;
+    refreshPaused = paused;
+    syncRefreshPauseIndicator(root);
+    if (paused || !refreshPending) return;
+    refreshResumeTimer = window.setTimeout(() => {
+      refreshResumeTimer = 0;
+      if (refreshPaused || !panel) return;
+      refreshPending = false;
+      syncRefreshPauseIndicator();
+      loadData(true, 'resume');
+    }, 150);
+  }
+
   function buildPanel(embedded = false) {
     const root = document.createElement('section');
     root.className = `fd-root fd-panel fd-platform-${PLATFORM}${embedded ? ' fd-panel--embedded' : ''}`;
@@ -841,6 +885,11 @@
 
     const actions = document.createElement('div');
     actions.className = 'fd-actions';
+    const refreshPause = document.createElement('span');
+    refreshPause.className = 'fd-refresh-pause';
+    refreshPause.setAttribute('role', 'status');
+    refreshPause.setAttribute('aria-live', 'polite');
+    refreshPause.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>';
     const translate = document.createElement('button');
     translate.type = 'button';
     translate.className = 'fd-translate';
@@ -866,7 +915,7 @@
     external.className = 'fd-external';
     external.target = '_blank';
     external.rel = 'noreferrer';
-    external.innerHTML = '<span class="fd-external-mark" aria-hidden="true">F</span>';
+    external.innerHTML = '<span>FOMO</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg>';
     external.title = '在 FOMO 官网打开';
     external.setAttribute('aria-label', external.title);
     const displayMode = document.createElement('button');
@@ -899,7 +948,7 @@
       saveOpen(false);
       syncUi();
     });
-    actions.append(translate, external);
+    actions.append(refreshPause, translate, external);
     if (PLATFORM === 'gmgn' || PLATFORM === 'debot') actions.append(displayMode);
     if (!embedded) actions.append(fold, close);
     bar.append(brand, platform, tabs, actions);
@@ -908,7 +957,10 @@
     stats.className = 'fd-stats';
     const list = document.createElement('div');
     list.className = 'fd-list';
+    list.addEventListener('mouseenter', () => setRefreshPaused(true, root));
+    list.addEventListener('mouseleave', () => setRefreshPaused(false, root));
     root.append(bar, stats, list);
+    syncRefreshPauseIndicator(root);
     if (!embedded) {
       makeDraggable(bar);
       syncFoldButton(root);
@@ -1130,7 +1182,7 @@
     const visualBottom = labelRect.bottom - paddingBottom;
     const visualCenter = (visualTop + visualBottom) / 2;
     const buttonHeight = debotButtonHost.getBoundingClientRect().height || 27;
-    debotButtonHost.style.left = `${orderRect.right - headerRect.left + 8}px`;
+    debotButtonHost.style.left = `${orderRect.right - headerRect.left + 14}px`;
     debotButtonHost.style.top = `${visualCenter - headerRect.top - buttonHeight / 2}px`;
   }
 
@@ -1228,6 +1280,10 @@
     panel = null;
     loadedKey = '';
     items = [];
+    refreshPaused = false;
+    refreshPending = false;
+    if (refreshResumeTimer) window.clearTimeout(refreshResumeTimer);
+    refreshResumeTimer = 0;
     if (refreshTimer) window.clearInterval(refreshTimer);
     refreshTimer = 0;
   }
@@ -1237,8 +1293,7 @@
     const seconds = Math.max(15, Math.min(300, Number(settings.fdRefreshSeconds) || 30));
     refreshTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
-        loadedKey = '';
-        loadData(true);
+        loadData(true, 'auto');
       }
     }, seconds * 1000);
   }

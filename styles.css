@@ -76,7 +76,7 @@
   flex: 0 0 auto;
   align-self: center;
   align-items: center;
-  margin-left: 8px;
+  margin-left: 14px;
 }
 
 .fd-debot-entry-anchor {
@@ -221,7 +221,7 @@
 .fd-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 5px;
   margin-left: auto;
 }
 
@@ -235,6 +235,35 @@
   color: var(--fd-text-muted);
   text-decoration: none;
   font-size: 13px;
+}
+
+.fd-refresh-pause {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  margin-right: 3px;
+  place-items: center;
+  border: 1px solid rgba(245, 184, 61, 0.28);
+  border-radius: 7px;
+  color: var(--fd-accent);
+  background: rgba(245, 184, 61, 0.14);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 140ms ease;
+}
+
+.fd-refresh-pause svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+}
+
+.fd-panel.is-refresh-paused .fd-refresh-pause {
+  opacity: 1;
+  visibility: visible;
 }
 
 .fd-actions .fd-close {
@@ -251,17 +280,27 @@
   stroke-linejoin: round;
 }
 
-.fd-external-mark {
-  display: grid;
-  width: 17px;
-  height: 17px;
-  place-items: center;
-  border: 1px solid currentColor;
-  border-radius: 50%;
-  color: var(--fd-accent);
+.fd-external {
+  display: inline-flex;
+  width: auto;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid var(--fd-border);
+  color: var(--fd-text-muted);
+  background: rgba(139, 147, 161, 0.08);
   font-size: 10px;
-  font-weight: 800;
-  line-height: 1;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.fd-external svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .fd-display-mode:hover {
