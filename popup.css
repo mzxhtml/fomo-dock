@@ -128,4 +128,22 @@ button { padding: 9px 10px; font-size: 11px; cursor: pointer; }
 button:hover { border-color: rgba(245, 184, 61, 0.5); }
 button.primary { border-color: rgba(245, 184, 61, 0.42); color: #f5b83d; background: rgba(245, 184, 61, 0.1); }
 
-.privacy { margin: 12px 2px 0; color: #667085; font-size: 9px; text-align: center; }
+.repository-links {
+  margin: 12px 2px 0;
+  color: #667085;
+  font-size: 9px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.repository-links p { margin: 0; }
+.repository-links p + p { margin-top: 2px; }
+
+.repository-links a {
+  color: #9ba4b5;
+  text-decoration: none;
+}
+
+.repository-links a:hover { color: #f5b83d; text-decoration: underline; }
+
+.privacy { margin: 5px 2px 0; color: #667085; font-size: 9px; text-align: center; }

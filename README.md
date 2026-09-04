@@ -1,6 +1,6 @@
 # FOMO Dock
 
-FOMO Dock 是一个面向 GMGN 和 DeBot 代币详情页的 Chrome Manifest V3 插件。它把 FOMO 数据做成独立浮窗，不包含原项目里的 Dev 高亮、Pump、985monitor 推送、持仓提醒、原生更新器等功能。
+FOMO Dock 是一个面向 GMGN 和 DeBot 代币详情页的 Chrome Manifest V3 插件。它把 FOMO 数据做成页内面板或独立浮窗，并提供默认关闭的 FOMO 推送混排；不包含原项目里的 Dev 高亮、Pump、持仓提醒、原生更新器等功能。
 
 ## 当前功能
 
@@ -11,6 +11,7 @@ FOMO Dock 是一个面向 GMGN 和 DeBot 代币详情页的 Chrome Manifest V3 �
 - 自动捕获当前浏览器里的 FOMO 登录态，并由 FOMO 页面自身的 Privy SDK 续期。
 - 浮窗可拖拽、折叠，两个平台分别记忆位置与开关状态。
 - 支持 Chrome 内置英文到中文本地翻译（浏览器支持时可用）。
+- 可选启用 FOMO 推送混排，连接 985monitor 后按其关注、屏蔽和事件偏好过滤内容。
 - 样式变量与组件规则分离，方便继续设计。
 
 支持网络：Ethereum、BSC、Base、Solana、Monad、Robinhood。
@@ -31,6 +32,8 @@ background.js    FOMO API、缓存、登录态保活
 fomo-early.js    FOMO 页面启动前的会话接续
 fomo-auth.js     FOMO 登录态捕获与心跳
 content.js       GMGN/DeBot 路由适配与浮窗业务
+feed-*           GMGN/DeBot 追踪流识别与 FOMO 推送混排
+monitor-auth.js  985monitor 只读会话与配置同步
 theme.css        颜色、圆角、阴影、宽度等主题变量
 styles.css       浮窗组件和响应式布局
 popup.*          插件设置与登录态状态
@@ -53,7 +56,7 @@ popup.*          插件设置与登录态状态
 
 ## 数据与隐私
 
-FOMO 登录令牌保存在 `chrome.storage.local`，只用于请求 `https://prod-api.fomo.family`。插件不会把令牌发送给 GMGN、DeBot 或其他服务。
+FOMO 登录令牌保存在 `chrome.storage.local`，只用于请求 `https://prod-api.fomo.family`。启用推送混排时，985monitor 签发的只读会话也只保存在本机，用于同步混排所需的关注、屏蔽和事件偏好。插件不会把这些令牌发送给 GMGN 或 DeBot。
 
 ## 来源说明
 
