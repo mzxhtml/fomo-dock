@@ -113,8 +113,8 @@
   inset: auto;
   z-index: 1;
   width: 100%;
-  height: min(680px, calc(100vh - 240px));
-  min-height: 420px;
+  height: min(900px, calc(100vh - 180px));
+  min-height: 560px;
   max-height: none;
   border: 0;
   border-top: 1px solid var(--fd-border);
@@ -320,13 +320,60 @@
   background: var(--fd-bg-hover);
 }
 
+.fd-avatar-link {
+  display: flex;
+  flex: none;
+  border-radius: 50%;
+}
+
+.fd-avatar-link:hover .fd-avatar {
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.32);
+}
+
+.fd-user-links {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
 .fd-item__name {
+  display: block;
   overflow: hidden;
+  min-width: 0;
   max-width: 150px;
   color: var(--fd-text);
   font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+a.fd-item__name:hover {
+  color: var(--fd-accent);
+}
+
+.fd-twitter-link {
+  display: inline-flex;
+  width: 17px;
+  height: 17px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: var(--fd-text-muted);
+}
+
+.fd-twitter-link:hover {
+  color: var(--fd-text);
+  background: var(--fd-bg-hover);
+}
+
+.fd-twitter-link svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
 }
 
 .fd-item__header time {

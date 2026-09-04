@@ -212,6 +212,19 @@
       || deepPick(item, /(username|handle|displayname|nickname)/i, 'string') || '匿名', 60);
   }
 
+  function userHandle(item) {
+    const user = userOf(item);
+    const value = cleanText(user.userHandle || item?.userHandle, 100);
+    if (!value) return '';
+    const socialUrl = value.match(/^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/([^/?#]+)/i);
+    return cleanText((socialUrl?.[1] || value).replace(/^@+/, ''), 60);
+  }
+
+  function twitterHandle(item) {
+    const handle = userHandle(item);
+    return /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : '';
+  }
+
   function userAvatar(item) {
     const user = userOf(item);
     const direct = cleanText(user.profilePictureLink || item?.profilePictureLink, 500);
@@ -219,9 +232,20 @@
     return deepPick(item, /(profilepic|profileimage|avatar|picture|image|photo)/i, 'url') || '';
   }
 
-  function buildUserHeader(item) {
+  function isolateUserLink(link) {
+    for (const type of ['pointerdown', 'mousedown', 'click', 'dblclick', 'touchstart']) {
+      link.addEventListener(type, (event) => event.stopPropagation());
+    }
+    link.addEventListener('keydown', (event) => event.stopPropagation());
+    return link;
+  }
+
+  function buildUserHeader(item, showTwitter = false) {
     const header = document.createElement('div');
     header.className = 'fd-item__header';
+    const handle = userHandle(item);
+    const profileUrl = handle
+      ? `https://fomo.family/profile/${encodeURIComponent(handle)}` : '';
     const avatar = userAvatar(item);
     if (avatar) {
       const image = document.createElement('img');
@@ -230,12 +254,46 @@
       image.alt = '';
       image.loading = 'lazy';
       image.referrerPolicy = 'no-referrer';
-      header.appendChild(image);
+      if (profileUrl) {
+        const avatarLink = isolateUserLink(document.createElement('a'));
+        avatarLink.className = 'fd-avatar-link';
+        avatarLink.href = profileUrl;
+        avatarLink.target = '_blank';
+        avatarLink.rel = 'noopener noreferrer';
+        avatarLink.title = '在 FOMO 查看用户';
+        avatarLink.appendChild(image);
+        header.appendChild(avatarLink);
+      } else {
+        header.appendChild(image);
+      }
     }
-    const name = document.createElement('strong');
+    const links = document.createElement('span');
+    links.className = 'fd-user-links';
+    const name = profileUrl
+      ? isolateUserLink(document.createElement('a'))
+      : document.createElement('strong');
     name.className = 'fd-item__name';
     name.textContent = userName(item);
-    header.appendChild(name);
+    if (profileUrl) {
+      name.href = profileUrl;
+      name.target = '_blank';
+      name.rel = 'noopener noreferrer';
+      name.title = '在 FOMO 查看用户';
+    }
+    links.appendChild(name);
+    const xHandle = showTwitter ? twitterHandle(item) : '';
+    if (xHandle) {
+      const twitter = isolateUserLink(document.createElement('a'));
+      twitter.className = 'fd-twitter-link';
+      twitter.href = `https://x.com/${encodeURIComponent(xHandle)}`;
+      twitter.target = '_blank';
+      twitter.rel = 'noopener noreferrer';
+      twitter.title = `在 X 查看 @${xHandle}`;
+      twitter.setAttribute('aria-label', twitter.title);
+      twitter.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231 5.45-6.231Zm-1.161 17.52h1.833L7.084 4.126H5.117L17.083 19.77Z"/></svg>';
+      links.appendChild(twitter);
+    }
+    header.appendChild(links);
     return header;
   }
 
@@ -319,7 +377,8 @@
         current.title = next.title;
         return;
       }
-      row.querySelector('.fd-item__name')?.insertAdjacentElement('afterend', next);
+      const name = row.querySelector('.fd-item__name');
+      (name?.closest('.fd-user-links') || name)?.insertAdjacentElement('afterend', next);
     });
   }
 
@@ -522,7 +581,7 @@
       const row = document.createElement('article');
       row.className = 'fd-item fd-holder';
       row.dataset.fdHolderAmount = String(holderTokenAmount(item));
-      const header = buildUserHeader(item);
+      const header = buildUserHeader(item, true);
       const rank = buildRankBadge(Number(row.dataset.fdHolderAmount));
       if (rank) header.appendChild(rank);
       const userId = userOf(item)?.id;
