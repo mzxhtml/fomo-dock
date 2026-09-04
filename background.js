@@ -23,6 +23,7 @@ const responseCache = new Map();
 const pnlCache = new Map();
 let keepAliveAt = 0;
 let refreshInFlight = null;
+let sessionOwnerQueue = Promise.resolve();
 
 function jwtExpiry(token) {
   try {
@@ -64,16 +65,39 @@ async function fomoTabs() {
   }
 }
 
+function isKeeperTab(tab) {
+  return String(tab?.url || '').includes('fomo_dock_keeper=');
+}
+
+async function dedupeKeeperTabs(tabs = null) {
+  const allTabs = Array.isArray(tabs) ? tabs : await fomoTabs();
+  const keepers = allTabs
+    .filter(isKeeperTab)
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  if (keepers.length < 2) return keepers[0] || null;
+
+  // Prefer the tab the user is currently viewing; otherwise keep the oldest
+  // non-discarded keeper so parallel checks always select the same owner.
+  const owner = keepers.find((tab) => tab.active && !tab.discarded)
+    || keepers.find((tab) => !tab.discarded)
+    || keepers[0];
+  const extras = keepers
+    .filter((tab) => tab.id !== owner.id)
+    .map((tab) => tab.id)
+    .filter(Number.isInteger);
+  if (extras.length) await chrome.tabs.remove(extras).catch(() => {});
+  return owner;
+}
+
 async function pageIsAlive() {
   const { fomoPage } = await chrome.storage.local.get('fomoPage');
   return Boolean(fomoPage?.at && Date.now() - fomoPage.at < 45_000);
 }
 
-async function ensureSessionOwner(dedicated = false) {
+async function ensureSessionOwnerUnlocked(dedicated = false) {
   try {
     const tabs = await fomoTabs();
-    const keepers = tabs.filter((tab) => String(tab.url || '').includes('fomo_dock_keeper='));
-    let owner = keepers.find((tab) => !tab.discarded) || keepers[0];
+    let owner = await dedupeKeeperTabs(tabs);
     let created = false;
     if (!owner && !dedicated) {
       owner = tabs.find((tab) => !tab.discarded && tab.status === 'complete')
@@ -83,7 +107,7 @@ async function ensureSessionOwner(dedicated = false) {
       owner = await chrome.tabs.create({ url: KEEPER_URL, active: false, pinned: true });
       created = true;
     }
-    const isKeeper = String(owner.url || '').includes('fomo_dock_keeper=');
+    const isKeeper = isKeeperTab(owner);
     const wasDiscarded = Boolean(owner.discarded);
     await chrome.tabs.update(owner.id, {
       autoDiscardable: false,
@@ -96,6 +120,13 @@ async function ensureSessionOwner(dedicated = false) {
   } catch {
     return null;
   }
+}
+
+function ensureSessionOwner(dedicated = false) {
+  const task = sessionOwnerQueue.then(() => ensureSessionOwnerUnlocked(dedicated));
+  // Keep later checks serialized even if a Chrome tabs operation fails.
+  sessionOwnerQueue = task.catch(() => null);
+  return task;
 }
 
 async function waitForMirroredToken(previous, timeoutMs = 35_000) {
@@ -290,9 +321,11 @@ async function recordHeartbeat(message, sender) {
   await chrome.storage.local.set({
     fomoPage: { at: Date.now(), visible: message?.visible === true, tabId, keeper },
   });
-  if (!keeper) {
+  if (keeper) {
+    await ensureSessionOwner(false);
+  } else {
     const extras = (await fomoTabs())
-      .filter((tab) => tab.id !== tabId && String(tab.url || '').includes('fomo_dock_keeper='))
+      .filter((tab) => tab.id !== tabId && isKeeperTab(tab))
       .map((tab) => tab.id)
       .filter(Number.isInteger);
     if (extras.length) await chrome.tabs.remove(extras).catch(() => {});
@@ -301,6 +334,7 @@ async function recordHeartbeat(message, sender) {
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 5 });
+  dedupeKeeperTabs().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -344,3 +378,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.alarms.get(KEEPALIVE_ALARM).then((alarm) => {
   if (!alarm) chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 5 });
 }).catch(() => {});
+
+// A service worker can start after Chrome has restored several stale pinned
+// keepers. Remove duplicates immediately without creating a new page.
+dedupeKeeperTabs().catch(() => {});
