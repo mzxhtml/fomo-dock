@@ -5,6 +5,7 @@ const DEFAULTS = {
   fdShowPnl: true,
   fdRefreshSeconds: 30,
   fdFeedEnabled: false,
+  fdThesisFontSize: 12,
 };
 
 const elements = {
@@ -12,6 +13,7 @@ const elements = {
   showPnl: document.querySelector('#show-pnl'),
   feedEnabled: document.querySelector('#feed-enabled'),
   feedNote: document.querySelector('#feed-note'),
+  thesisFontSize: document.querySelector('#thesis-font-size'),
   refresh: document.querySelector('#refresh-seconds'),
   statusDot: document.querySelector('#status-dot'),
   statusTitle: document.querySelector('#status-title'),
@@ -58,6 +60,7 @@ async function init() {
   elements.enabled.checked = stored.fdEnabled;
   elements.showPnl.checked = stored.fdShowPnl;
   elements.feedEnabled.checked = stored.fdFeedEnabled;
+  elements.thesisFontSize.value = String(stored.fdThesisFontSize);
   elements.refresh.value = String(stored.fdRefreshSeconds);
   elements.version.textContent = `v${chrome.runtime.getManifest().version}`;
   renderSession(stored.fomoToken);
@@ -76,6 +79,9 @@ elements.feedEnabled.addEventListener('change', () => {
   chrome.storage.local.set({ fdFeedEnabled: elements.feedEnabled.checked });
 });
 
+elements.thesisFontSize.addEventListener('change', () => {
+  chrome.storage.local.set({ fdThesisFontSize: Number(elements.thesisFontSize.value) });
+});
 
 elements.refresh.addEventListener('change', () => {
   chrome.storage.local.set({ fdRefreshSeconds: Number(elements.refresh.value) });

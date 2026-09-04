@@ -560,6 +560,11 @@ a.fd-item__name:hover {
   word-break: break-word;
 }
 
+.fd-panel .fd-item__text,
+.fd-panel .fd-translation {
+  font-size: var(--fd-thesis-font-size, 12px);
+}
+
 .fd-translation {
   padding-left: 9px;
   border-left: 2px solid var(--fd-accent);

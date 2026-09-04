@@ -18,6 +18,7 @@
     fdDisplayMode: 'tab',
     fdPanelOpen: {},
     fdPanelPos: {},
+    fdThesisFontSize: 12,
   };
 
   const NETWORK_IDS = {
@@ -854,6 +855,9 @@
     const root = document.createElement('section');
     root.className = `fd-root fd-panel fd-platform-${PLATFORM}${embedded ? ' fd-panel--embedded' : ''}`;
     root.dataset.platform = PLATFORM;
+    const thesisFontSize = [11, 12, 14, 16].includes(Number(settings.fdThesisFontSize))
+      ? Number(settings.fdThesisFontSize) : DEFAULTS.fdThesisFontSize;
+    root.style.setProperty('--fd-thesis-font-size', `${thesisFontSize}px`);
 
     const bar = document.createElement('header');
     bar.className = 'fd-bar';
@@ -1386,15 +1390,22 @@
     if (area !== 'local') return;
     let refreshChanged = false;
     let translateChanged = false;
+    let thesisFontChanged = false;
     for (const [key, change] of Object.entries(changes)) {
       if (key in DEFAULTS) settings[key] = change.newValue ?? DEFAULTS[key];
       if (key === 'fdRefreshSeconds') refreshChanged = true;
       if (key === 'fdTranslate') translateChanged = true;
+      if (key === 'fdThesisFontSize') thesisFontChanged = true;
       if (key === 'fomoToken') loadedKey = '';
     }
     syncUi();
     if (translateChanged && settings.fdTranslate) translateWhenReady();
     if (refreshChanged && panel) syncRefreshTimer();
+    if (thesisFontChanged && panel) {
+      const size = [11, 12, 14, 16].includes(Number(settings.fdThesisFontSize))
+        ? Number(settings.fdThesisFontSize) : DEFAULTS.fdThesisFontSize;
+      panel.style.setProperty('--fd-thesis-font-size', `${size}px`);
+    }
   });
 
   window.addEventListener('resize', () => {
