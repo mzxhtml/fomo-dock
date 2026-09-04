@@ -53,6 +53,8 @@
   let gmgnButtonHost = null;
   let gmgnButton = null;
   let gmgnPreviousTabId = '';
+  let debotButtonHost = null;
+  let debotButton = null;
   let activeTab = 'holders';
   let loadedKey = '';
   let loading = false;
@@ -138,7 +140,8 @@
   }
 
   function isEmbeddedMode() {
-    return PLATFORM === 'gmgn' && settings.fdDisplayMode === 'tab';
+    return (PLATFORM === 'gmgn' || PLATFORM === 'debot')
+      && settings.fdDisplayMode === 'tab';
   }
 
   function saveOpen(open) {
@@ -897,7 +900,7 @@
       syncUi();
     });
     actions.append(translate, external);
-    if (PLATFORM === 'gmgn') actions.append(displayMode);
+    if (PLATFORM === 'gmgn' || PLATFORM === 'debot') actions.append(displayMode);
     if (!embedded) actions.append(fold, close);
     bar.append(brand, platform, tabs, actions);
 
@@ -1061,6 +1064,162 @@
     loadData(false);
   }
 
+  function debotTabContext() {
+    const devTab = [...document.querySelectorAll('[role="tab"]')]
+      .find((node) => /^\s*(?:开发者代币|Developer Tokens?)/i.test(node.textContent || ''));
+    const tabList = devTab?.closest('[role="tablist"]');
+    const tabsRoot = tabList?.parentElement?.parentElement;
+    if (!devTab || !tabList || !tabsRoot) return null;
+    const orderTab = [...tabList.querySelectorAll('[role="tab"]')]
+      .find((node) => /^\s*(?:订单|Orders?)/i.test(node.textContent || ''));
+    if (!orderTab) return null;
+
+    // DeBot nests the MUI tabs in two one-child layout boxes. Their parent is
+    // the complete toolbar row, whose following siblings are the native panel.
+    let tabBox = tabsRoot;
+    while (tabBox.parentElement?.children.length === 1) tabBox = tabBox.parentElement;
+    const headerRow = tabBox.parentElement;
+    const panelParent = headerRow?.parentElement;
+    if (!headerRow || !panelParent || !headerRow.contains(tabsRoot)) return null;
+    const nativePanels = [...panelParent.children]
+      .filter((node) => node !== headerRow && !node.classList.contains('fd-panel--embedded'));
+    if (!nativePanels.length) return null;
+    return { orderTab, tabList, headerRow, nativePanels, panelParent };
+  }
+
+  function restoreDebotPanels() {
+    document.querySelectorAll('[data-fd-debot-panel-hidden]').forEach((nativePanel) => {
+      const original = nativePanel.dataset.fdDebotPanelDisplay || '';
+      if (original) nativePanel.style.display = original;
+      else nativePanel.style.removeProperty('display');
+      delete nativePanel.dataset.fdDebotPanelHidden;
+      delete nativePanel.dataset.fdDebotPanelDisplay;
+    });
+  }
+
+  function hideDebotPanels(context) {
+    context.nativePanels.forEach((nativePanel) => {
+      if (!nativePanel.dataset.fdDebotPanelHidden) {
+        nativePanel.dataset.fdDebotPanelHidden = '1';
+        nativePanel.dataset.fdDebotPanelDisplay = nativePanel.style.display || '';
+      }
+      nativePanel.style.setProperty('display', 'none', 'important');
+    });
+  }
+
+  function deactivateDebotButton() {
+    restoreDebotPanels();
+    debotButtonHost?.remove();
+    document.querySelectorAll('.fd-debot-entry-anchor')
+      .forEach((node) => node.classList.remove('fd-debot-entry-anchor'));
+    debotButtonHost = null;
+    debotButton?.remove();
+    debotButton = null;
+  }
+
+  function positionDebotButton(context) {
+    if (!debotButtonHost?.isConnected || !context?.headerRow || !context.orderTab) return;
+    const headerRect = context.headerRow.getBoundingClientRect();
+    const orderRect = context.orderTab.getBoundingClientRect();
+    const label = context.orderTab.firstElementChild || context.orderTab;
+    const labelRect = label.getBoundingClientRect();
+    const labelStyle = getComputedStyle(label);
+    const paddingTop = Number.parseFloat(labelStyle.paddingTop) || 0;
+    const paddingBottom = Number.parseFloat(labelStyle.paddingBottom) || 0;
+    const visualTop = labelRect.top + paddingTop;
+    const visualBottom = labelRect.bottom - paddingBottom;
+    const visualCenter = (visualTop + visualBottom) / 2;
+    const buttonHeight = debotButtonHost.getBoundingClientRect().height || 27;
+    debotButtonHost.style.left = `${orderRect.right - headerRect.left + 8}px`;
+    debotButtonHost.style.top = `${visualCenter - headerRect.top - buttonHeight / 2}px`;
+  }
+
+  function ensureDebotButton(context) {
+    if (!debotButton?.isConnected || debotButtonHost?.parentElement !== context.headerRow) {
+      debotButtonHost?.remove();
+      document.querySelectorAll('.fd-debot-entry-anchor')
+        .forEach((node) => node.classList.remove('fd-debot-entry-anchor'));
+      context.headerRow.classList.add('fd-debot-entry-anchor');
+      debotButtonHost = document.createElement('span');
+      debotButtonHost.className = 'fd-root fd-debot-entry-host';
+
+      debotButton = document.createElement('button');
+      debotButton.type = 'button';
+      debotButton.id = 'fd-debot-entry';
+      debotButton.className = 'fd-root fd-debot-entry';
+      debotButton.setAttribute('aria-controls', 'fd-debot-panel-fomo');
+      debotButton.setAttribute('aria-pressed', 'false');
+      debotButton.title = '打开或关闭 FOMO';
+      debotButton.textContent = 'FOMO';
+
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'touchstart', 'touchend']
+        .forEach((type) => {
+          debotButton.addEventListener(type, (event) => event.stopPropagation());
+        });
+      debotButton.addEventListener('keydown', (event) => event.stopPropagation());
+      debotButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        saveOpen(!isOpen());
+        syncUi();
+      });
+      debotButtonHost.appendChild(debotButton);
+      context.headerRow.appendChild(debotButtonHost);
+    }
+    positionDebotButton(context);
+
+    if (context.tabList.dataset.fdDebotListener !== '1') {
+      context.tabList.dataset.fdDebotListener = '1';
+      context.tabList.addEventListener('click', (event) => {
+        const targetTab = event.target.closest?.('[role="tab"]');
+        if (!targetTab || PLATFORM !== 'debot' || !isEmbeddedMode()) return;
+        saveOpen(false);
+        window.setTimeout(() => {
+          restoreDebotPanels();
+          teardownPanel();
+          debotButton?.classList.remove('is-active');
+          debotButton?.setAttribute('aria-pressed', 'false');
+        });
+      });
+    }
+  }
+
+  function syncDebotButton(route) {
+    const context = debotTabContext();
+    if (!context) {
+      restoreDebotPanels();
+      teardownPanel();
+      return;
+    }
+    ensureDebotButton(context);
+    if (!isOpen()) {
+      restoreDebotPanels();
+      if (panel?.classList.contains('fd-panel--embedded')) teardownPanel();
+      debotButton.classList.remove('is-active');
+      debotButton.setAttribute('aria-pressed', 'false');
+      return;
+    }
+
+    debotButton.classList.add('is-active');
+    debotButton.setAttribute('aria-pressed', 'true');
+    hideDebotPanels(context);
+
+    if (!panel?.classList.contains('fd-panel--embedded') || !panel.isConnected) {
+      teardownPanel();
+      const latestContext = debotTabContext();
+      if (!latestContext?.panelParent) return;
+      hideDebotPanels(latestContext);
+      panel = buildPanel(true);
+      panel.id = 'fd-debot-panel-fomo';
+      panel.setAttribute('role', 'region');
+      panel.setAttribute('aria-labelledby', debotButton.id);
+      latestContext.panelParent.appendChild(panel);
+      syncRefreshTimer();
+    }
+    panel.querySelector('.fd-external').href = `https://fomo.family/tokens/${FOMO_CHAIN[route.chain] || route.chain}/${encodeURIComponent(route.address)}`;
+    loadData(false);
+  }
+
   function teardownPanel() {
     translationRun += 1;
     pnlObserver?.disconnect();
@@ -1091,6 +1250,7 @@
       launcher = null;
       teardownPanel();
       deactivateGmgnButton({ restoreSelection: true });
+      deactivateDebotButton();
       return;
     }
 
@@ -1098,11 +1258,13 @@
       launcher?.remove();
       launcher = null;
       if (panel && !panel.classList.contains('fd-panel--embedded')) teardownPanel();
-      syncGmgnButton(route);
+      if (PLATFORM === 'gmgn') syncGmgnButton(route);
+      else syncDebotButton(route);
       return;
     }
 
     deactivateGmgnButton({ restoreSelection: true });
+    deactivateDebotButton();
     if (panel?.classList.contains('fd-panel--embedded')) teardownPanel();
 
     if (!launcher) {

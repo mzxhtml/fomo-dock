@@ -70,7 +70,8 @@
   backdrop-filter: blur(18px);
 }
 
-.fd-gmgn-entry-host {
+.fd-gmgn-entry-host,
+.fd-debot-entry-host {
   display: inline-flex;
   flex: 0 0 auto;
   align-self: center;
@@ -78,7 +79,27 @@
   margin-left: 8px;
 }
 
-.fd-gmgn-entry {
+.fd-debot-entry-anchor {
+  position: relative !important;
+  overflow: visible !important;
+}
+
+.fd-debot-entry-host {
+  position: absolute;
+  z-index: 2;
+  height: 27px;
+  margin: 0;
+}
+
+.fd-debot-entry {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.fd-gmgn-entry,
+.fd-debot-entry {
   align-self: center;
   height: 27px;
   margin: 0;
@@ -95,13 +116,15 @@
   transition: color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
 }
 
-.fd-gmgn-entry:hover {
+.fd-gmgn-entry:hover,
+.fd-debot-entry:hover {
   color: var(--fd-accent);
   border-color: var(--fd-accent);
   background: var(--fd-accent-soft);
 }
 
-.fd-gmgn-entry.is-active {
+.fd-gmgn-entry.is-active,
+.fd-debot-entry.is-active {
   color: #111318;
   border-color: var(--fd-accent);
   background: var(--fd-accent);
