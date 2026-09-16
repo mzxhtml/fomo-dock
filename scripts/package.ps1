@@ -4,7 +4,7 @@ $manifest = Get-Content -LiteralPath (Join-Path $projectDir 'manifest.json') -Ra
 $files = @(
     'manifest.json', 'background.js', 'content.js', 'feed-content.js',
     'feed-bridge.js', 'gmgn-holder-bridge.js', 'fomo-auth.js', 'monitor-auth.js',
-    'theme.css', 'styles.css', 'feed.css', 'popup.html', 'popup.js', 'popup.css',
+    'theme.css', 'styles.css', 'feed.css', 'extras.js', 'extras.css', 'popup.html', 'popup.js', 'popup.css',
     'README.md', 'CHANGELOG.md', 'icons'
 )
 $paths = $files | ForEach-Object {

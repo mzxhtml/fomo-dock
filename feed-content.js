@@ -248,6 +248,7 @@
     stripe.style.backgroundColor = CHAIN_COLORS[event.chain] || '#8a93a6';
     const top = document.createElement('div');
     top.className = 'fd-feed-card__top';
+    top.dataset.fdRankHandle = event.handle || '';
     const picture = avatar(event, 'fd-feed-card__avatar');
     const name = document.createElement('strong');
     name.className = 'fd-feed-card__name';
@@ -322,6 +323,7 @@
     const stripe = document.createElement('span');
     stripe.className = 'fd-feed-table__stripe'; stripe.style.backgroundColor = CHAIN_COLORS[event.chain] || '#8a93a6';
     const who = feedCell('fd-feed-table__who', '');
+    who.dataset.fdRankHandle = event.handle || '';
     const picture = avatar(event, 'fd-feed-table__avatar');
     const name = document.createElement('strong');
     name.className = 'fd-feed-table__name'; name.textContent = safeText(event.name || event.handle, 40);

@@ -19,6 +19,7 @@
     fdPanelOpen: {},
     fdPanelPos: {},
     fdThesisFontSize: 12,
+    fdShowTrending: true,
   };
 
   const NETWORK_IDS = {
@@ -280,6 +281,7 @@
     }
     const links = document.createElement('span');
     links.className = 'fd-user-links';
+    links.dataset.fdRankHandle = handle;
     const name = profileUrl
       ? isolateUserLink(document.createElement('a'))
       : document.createElement('strong');
@@ -640,6 +642,7 @@
   }
 
   function renderItems(list, values, kind) {
+    if (kind === 'trending') return window.FomoDockExtras?.renderTrending(list, values);
     if (kind === 'holders') return renderHolders(list, values);
     list.replaceChildren();
     if (!values.length) return renderEmpty(list, kind === 'thesis' ? '还没有人发表观点' : '暂无交易');
@@ -687,6 +690,11 @@
   function renderStats(response) {
     const stats = panel?.querySelector('.fd-stats');
     if (!stats) return;
+    if (activeTab !== 'trending' && window.FomoDockExtras?.renderHoldingStats) {
+      window.FomoDockExtras.renderHoldingStats(stats, tokenRoute(), activeTab === 'holders' ? response : null);
+      return;
+    }
+    delete stats.dataset.fdHoldingKey;
     stats.replaceChildren();
     const count = activeTab === 'holders' && Number(response?.total) > 0
       ? Number(response.total) : Number(response?.count) || items.length;
@@ -694,7 +702,7 @@
       ? items.reduce((sum, item) => sum + (Number(item?.value) || 0), 0) : 0;
     const values = activeTab === 'holders'
       ? [['FOMO 持有人数', count.toLocaleString('zh-CN')], ['Top 持仓合计', money(totalValue) || '$0']]
-      : [[activeTab === 'thesis' ? '观点' : '交易', `${count} 条`], ['更新', new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })]];
+      : [[activeTab === 'trending' ? '全网络热门' : activeTab === 'thesis' ? '观点' : '交易', `${count} 条`], ['更新', new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })]];
     for (const [label, value] of values) {
       const block = document.createElement('div');
       block.className = 'fd-stat';
@@ -781,12 +789,15 @@
       renderEmpty(list, '加载中…');
     }
     const response = await runtimeMessage({
-      type: 'fomo-token-feed',
+      type: activeTab === 'trending' ? 'fomo-trending' : 'fomo-token-feed',
       payload: { tokenAddress: route.address, networkId: route.networkId, kind: activeTab },
     });
     loading = false;
     if (!panel || !panel.contains(list) || routeKey() !== routeKey(route)
-      || `${activeTab}|${routeKey(route)}` !== key) return;
+      || `${activeTab}|${routeKey(route)}` !== key) {
+      if (panel) loadData(false);
+      return;
+    }
     if (backgroundRefresh && refreshPaused) {
       refreshPending = true;
       syncRefreshPauseIndicator();
@@ -915,10 +926,11 @@
     platform.textContent = PLATFORM === 'debot' ? 'DeBot' : 'GMGN';
     const tabs = document.createElement('nav');
     tabs.className = 'fd-tabs';
-    for (const [id, label] of [['holders', '持仓'], ['thesis', '观点'], ['swaps', '交易']]) {
+    for (const [id, label] of [['holders', '持仓'], ['thesis', '观点'], ['swaps', '交易'], ['trending', '热门']]) {
       const button = document.createElement('button');
       button.type = 'button';
       button.dataset.tab = id;
+      button.hidden = id === 'trending' && !settings.fdShowTrending;
       button.textContent = label;
       button.classList.toggle('is-active', activeTab === id);
       button.addEventListener('click', () => {
@@ -1353,6 +1365,12 @@
 
   function syncUi() {
     const route = tokenRoute();
+    window.FomoDockExtras?.syncHeader(route);
+    if (activeTab === 'trending' && !settings.fdShowTrending) { activeTab = 'holders'; loadedKey = ''; }
+    panel?.querySelectorAll('.fd-tabs button').forEach(button => {
+      button.hidden = button.dataset.tab === 'trending' && !settings.fdShowTrending;
+      button.classList.toggle('is-active', button.dataset.tab === activeTab);
+    });
     if (!settings.fdEnabled || !route) {
       launcher?.remove();
       launcher = null;

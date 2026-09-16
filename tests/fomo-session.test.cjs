@@ -82,7 +82,7 @@ function harness({ tabs = [], local = {}, session = {}, sdk = 'ready', initialKe
     } },
   };
   const context = vm.createContext({ chrome, Date: ClockDate, URL, atob, console, crypto: require('node:crypto').webcrypto,
-    AbortController, AbortSignal,
+    AbortController, AbortSignal, TextDecoder,
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { at: now + ms, fn }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
@@ -387,4 +387,56 @@ test('current feed 401 disconnects promptly without a transaction deadlock', asy
   h.context.fetch = async () => ({ status: 401, json: async () => ({}) });
   assert.equal((await h.context.fetchFomoFeed()).reason, 'not-connected');
   assert.equal(h.local.monitor985SessionV1, null);
+});
+
+function rankBody(rows = [['alice', 'all', 3]]) {
+  const text = `event: fomo-rank-collect\ndata: {"task":"ignore"}\n\nevent: fomo-ranks\r\ndata: ${JSON.stringify({ event: { updatedAt: START, ranks: rows } })}\r\n\r\n`;
+  return new ReadableStream({ start(controller) {
+    for (let i = 0; i < text.length; i += 7) controller.enqueue(new TextEncoder().encode(text.slice(i, i + 7)));
+    controller.close();
+  } });
+}
+const rankLocal = () => ({ monitor985SessionV1: { token: 'readonly', accountId: '0xAlice', expiresAt: START + 600_000 }, monitor985SyncStateV1: { connected: true } });
+
+test('rank stream reads snapshots only, caches them across worker restarts and never advertises collection', async () => {
+  const h = harness({ local: rankLocal() });
+  let requests = 0;
+  h.context.fetch = async (url, options) => {
+    requests++;
+    assert.equal(url, 'https://www.985monitor.xyz/api/extension/events-stream');
+    assert.equal(options.method, undefined);
+    assert.equal(options.headers.Authorization, 'Bearer readonly');
+    return { status: 200, ok: true, body: rankBody() };
+  };
+  const [a, b] = await Promise.all([h.context.fetchFomoRanks(), h.context.fetchFomoRanks()]);
+  assert.equal(a.ranks[0][2], 3); assert.equal(b.ranks.length, 1); assert.equal(requests, 1);
+  const restart = harness({ local: h.local });
+  restart.context.fetch = () => { throw Error('Cache should be reused'); };
+  assert.equal((await restart.context.fetchFomoRanks()).ranks[0][0], 'alice');
+});
+
+test('rank data stays hidden without login or when disabled; stale and malformed rows are rejected', async () => {
+  for (const local of [{}, { ...rankLocal(), fdShowKolRank: false }, { ...rankLocal(), fdEnabled: false }]) {
+    const h = harness({ local }); let called = false;
+    h.context.fetch = async () => { called = true; throw Error('Unexpected request'); };
+    assert.equal((await h.context.fetchFomoRanks()).ranks.length, 0); assert.equal(called, false);
+  }
+  const h = harness();
+  assert.equal(h.context.normalizeKolRanks({ updatedAt: START - 86_400_001, ranks: [['a', 'all', 1]] }), null);
+  const result = h.context.normalizeKolRanks({ updatedAt: START, ranks: [['@Alice', 'all', 3], ['alice', '7d', 1], ['bad', 'all', -1], ['x', 'bogus', 1], ['<script>', 'all', 1]] });
+  assert.equal(result.ranks.length, 1);
+  assert.equal(result.ranks[0][0], 'alice');
+});
+
+test('late rank snapshot cannot cross accounts and 401 hides ranks', async () => {
+  const h = harness({ local: rankLocal() });
+  h.context.fetch = async () => {
+    h.local.monitor985SessionV1 = { token: 'new', accountId: '0xBob', expiresAt: START + 600_000 };
+    return { status: 200, ok: true, body: rankBody() };
+  };
+  assert.equal((await h.context.fetchFomoRanks()).ok, false);
+  assert.equal(h.local.fdKolRanksV1, undefined);
+  h.context.fetch = async () => ({ status: 401 });
+  assert.equal((await h.context.fetchFomoRanks()).ok, false);
+  assert.equal(h.local.monitor985SyncStateV1.connected, false);
 });

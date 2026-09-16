@@ -167,6 +167,34 @@
   cursor: grabbing;
 }
 
+/* Keep all actions visible at the floating panel's default width. */
+.fd-panel:not(.fd-panel--embedded) .fd-bar {
+  display: grid;
+  flex: none;
+  grid-template-columns: auto 1fr auto;
+}
+
+.fd-panel:not(.fd-panel--embedded) .fd-bar > .fd-brand {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.fd-panel:not(.fd-panel--embedded) .fd-bar > .fd-platform {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: start;
+}
+
+.fd-panel:not(.fd-panel--embedded) .fd-bar > .fd-actions {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.fd-panel:not(.fd-panel--embedded) .fd-bar > .fd-tabs {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
 .fd-brand {
   display: inline-flex;
   align-items: center;
@@ -319,6 +347,7 @@
 
 .fd-stats {
   display: grid;
+  flex: none;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   padding: 10px;
@@ -359,6 +388,13 @@
   border-bottom: 1px solid var(--fd-border);
   color: var(--fd-text-muted);
   font-size: 11px;
+}
+
+.fd-stat small {
+  min-height: 15px;
+  color: var(--fd-text-muted);
+  font-size: 10px;
+  line-height: 15px;
 }
 
 .fd-request-status[hidden],

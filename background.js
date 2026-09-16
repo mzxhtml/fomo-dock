@@ -316,6 +316,144 @@ async function fetchFomoFeedOnce() {
   }
 }
 
+let trendingPending = null;
+let trendingCache = null;
+
+function compactTrending(value) {
+  const chains = { 1: 'eth', 56: 'bsc', 143: 'monad', 4663: 'robinhood', 5042: 'arc', 8453: 'base', 1399811149: 'sol' };
+  const numeric = (n) => n !== null && n !== '' && Number.isFinite(Number(n)) ? Number(n) : null;
+  const seen = new Set();
+  return (Array.isArray(value) ? value : []).slice(0, 100).flatMap((raw) => {
+    const token = raw?.token;
+    const chain = chains[token?.networkId];
+    let address = String(token?.address || '').trim();
+    if (!chain || !(chain === 'sol' ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/ : /^0x[a-fA-F0-9]{40}$/).test(address)) return [];
+    if (chain !== 'sol') address = address.toLowerCase();
+    const key = `${chain}|${address}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    const image = String(token.info?.imageSmallUrl || token.info?.imageThumbUrl || '');
+    return [{ chain, address, symbol: String(token.symbol || '').slice(0, 24),
+      image: /^https:\/\//.test(image) ? image.slice(0, 500) : '',
+      price: numeric(raw.priceUSD), marketCap: numeric(raw.marketCap), change24: numeric(raw.change24),
+      volume24: numeric(raw.volume24), holders: numeric(raw.holders) }];
+  }).slice(0, 50);
+}
+
+function fetchFomoTrending() {
+  if (trendingCache && Date.now() - trendingCache.at < CACHE_TTL_MS) return Promise.resolve(trendingCache.data);
+  if (trendingPending) return trendingPending;
+  trendingPending = (async () => {
+    try {
+      const { response, body, unauthorized, stored } = await authenticatedFetch('/proxy/trendingTokens', 'POST');
+      if (unauthorized) return { ok: false, reason: stored?.token ? 'expired' : 'no-token' };
+      if (!response.ok || body?.success === false || (body?.statusCode && Number(body.statusCode) !== 200)) {
+        return { ok: false, reason: `http-${response.status}` };
+      }
+      if (!Array.isArray(body?.responseObject)) return { ok: false, reason: 'invalid-response' };
+      const data = { ok: true, items: compactTrending(body.responseObject), fetchedAt: Date.now() };
+      trendingCache = { at: Date.now(), data };
+      return data;
+    } catch (error) { return requestFailure(error, trendingCache); }
+    finally { trendingPending = null; }
+  })();
+  return trendingPending;
+}
+
+const RANK_CACHE_KEY = 'fdKolRanksV1';
+const RANK_MAX_AGE = 24 * 60 * 60_000;
+let rankPending = null;
+let rankController = null;
+let rankGeneration = 0;
+
+function normalizeKolRanks(raw) {
+  const updatedAt = Number(raw?.updatedAt);
+  if (!(updatedAt > Date.now() - RANK_MAX_AGE && updatedAt <= Date.now() + 60_000)) return null;
+  const ranks = [];
+  const seen = new Set();
+  for (const row of (Array.isArray(raw.ranks) ? raw.ranks : []).slice(0, 500)) {
+    if (!Array.isArray(row)) continue;
+    const handle = String(row[0] || '').replace(/^@+/, '').toLowerCase();
+    const rank = Number(row[2]);
+    if (!/^[a-z0-9_.-]{1,40}$/.test(handle) || !['all', '30d', '7d', '24h'].includes(row[1])
+      || !Number.isSafeInteger(rank) || rank <= 0 || rank > 10000 || seen.has(handle)) continue;
+    seen.add(handle); ranks.push([handle, row[1], rank]);
+  }
+  return { updatedAt, ranks };
+}
+
+async function readRankSnapshot(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', type = '', data = [], bytes = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) return null;
+      bytes += chunk.value.byteLength;
+      if (bytes > 2_000_000) return null;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let index;
+      while ((index = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, index).replace(/\r$/, ''); buffer = buffer.slice(index + 1);
+        if (!line) {
+          if (type === 'fomo-ranks') {
+            try { const snapshot = normalizeKolRanks(JSON.parse(data.join('\n'))?.event); if (snapshot) return snapshot; } catch {}
+          }
+          type = ''; data = [];
+        } else if (line.startsWith('event:')) type = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+      }
+    }
+  } finally { await reader.cancel().catch(() => {}); }
+}
+
+function fetchFomoRanks() {
+  if (rankPending) return rankPending;
+  const generation = rankGeneration;
+  rankPending = (async () => {
+    const options = await chrome.storage.local.get({ fdEnabled: true, fdShowKolRank: true,
+      monitor985SyncStateV1: null, [RANK_CACHE_KEY]: null });
+    const session = await monitor985Session();
+    if (!options.fdEnabled || !options.fdShowKolRank || !session || !options.monitor985SyncStateV1?.connected) {
+      return { ok: false, ranks: [] };
+    }
+    const cache = options[RANK_CACHE_KEY];
+    const sameAccount = cache?.account === monitorAccount(session.accountId);
+    const cached = sameAccount && normalizeKolRanks(cache);
+    const current = async () => generation === rankGeneration && await monitorSessionIsCurrent(session);
+    if (sameAccount && Date.now() < cache.retryAt) {
+      return await current() ? { ok: true, ...(cached || { ranks: [] }) } : { ok: false, ranks: [] };
+    }
+    const controller = new AbortController(); rankController = controller;
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    let snapshot = null;
+    let retryMs = 5 * 60_000;
+    try {
+      // Read only the existing snapshot; never advertise a rank collector or upload data.
+      const response = await fetch(`${MONITOR985_ORIGIN}/api/extension/events-stream`, {
+        headers: { Accept: 'text/event-stream', Authorization: `Bearer ${session.token}` },
+        cache: 'no-store', signal: controller.signal,
+      });
+      if (response.status === 401) {
+        await markMonitor985Disconnected('unauthorized', true, session);
+        return { ok: false, ranks: [] };
+      }
+      if (response.status === 429) retryMs = Math.max(retryMs, retryAfterMs(response, Date.now()));
+      if (response.ok && response.body) snapshot = await readRankSnapshot(response.body);
+    } catch { /* Keep a recent snapshot on transient failure. */ }
+    finally { clearTimeout(timer); controller.abort(); if (rankController === controller) rankController = null; }
+    return monitorTransaction(async () => {
+      if (!await current()) return { ok: false, ranks: [] };
+      const result = snapshot || cached || { ranks: [], updatedAt: 0 };
+      await chrome.storage.local.set({ [RANK_CACHE_KEY]: { ...result,
+        account: monitorAccount(session.accountId), retryAt: Date.now() + retryMs } });
+      return { ok: true, ...result };
+    });
+  })().finally(() => { rankPending = null; });
+  return rankPending;
+}
+
 function jwtExpiry(token) {
   try {
     const part = String(token).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
@@ -610,7 +748,7 @@ function retryAfterMs(response, now) {
 // All official FOMO API calls, including PnL and auth retries, share one queue.
 // Consume the body before releasing the slot; a slow response cannot overlap
 // the next request. Cooldown survives service-worker and browser restarts.
-async function queuedFomoFetch(path, token) {
+async function queuedFomoFetch(path, token, method = 'GET') {
   await loadFomoRateLimit();
   checkFomoRateLimit();
   const task = fomoRequestTail.then(async () => {
@@ -624,7 +762,7 @@ async function queuedFomoFetch(path, token) {
     const timeout = setTimeout(() => controller.abort(), 25_000);
     try {
       const response = await fetch(`${FOMO_API}${path}`, {
-        headers, credentials: 'include', cache: 'no-store', signal: controller.signal,
+        method, headers, credentials: 'include', cache: 'no-store', signal: controller.signal,
       });
       if (response.status === 429) {
         const now = Date.now();
@@ -672,7 +810,7 @@ function shareRequest(pending, key, run) {
   return pending.get(key);
 }
 
-async function authenticatedFetch(path) {
+async function authenticatedFetch(path, method = 'GET') {
   await loadFomoRateLimit();
   checkFomoRateLimit();
   let stored = (await chrome.storage.local.get('fomoToken')).fomoToken || null;
@@ -682,13 +820,13 @@ async function authenticatedFetch(path) {
       || null;
   }
 
-  let result = await queuedFomoFetch(path, stored?.token);
+  let result = await queuedFomoFetch(path, stored?.token, method);
   const isUnauthorized = ({ response, body }) => response.status === 401 || bodyIsUnauthorized(body);
   if (isUnauthorized(result) && stored?.token) {
     const renewed = await refreshSession();
     if (renewed?.token && renewed.token !== stored.token) {
       stored = renewed;
-      result = await queuedFomoFetch(path, renewed.token);
+      result = await queuedFomoFetch(path, renewed.token, method);
     }
   }
   return { ...result, stored, unauthorized: isUnauthorized(result) };
@@ -852,6 +990,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'fomo-trending' || message?.type === 'fomo-ranks') {
+    const task = message.type === 'fomo-trending' ? fetchFomoTrending() : fetchFomoRanks();
+    task.then(sendResponse).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
   if (message?.type === '985-monitor-sync-acquire' || message?.type === '985-monitor-sync-finish') {
     const task = message.type.endsWith('acquire') ? acquireMonitorSync(message, sender) : finishMonitorSync(message, sender);
     task.then(sendResponse).catch(() => sendResponse({ ok: false }));
@@ -916,6 +1059,10 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && (changes.monitor985SessionV1 || changes.fdShowKolRank || changes.fdEnabled
+    || changes.monitor985SyncStateV1?.newValue?.connected === false)) {
+    rankGeneration++; rankController?.abort();
+  }
   if (area === 'local' && changes.monitor985SessionV1) resetFomoFeedCache();
   if (area === 'local' && (changes.fomoToken || changes.fdEnabled)) scheduleSessionExpiry().catch(() => {});
 });

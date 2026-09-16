@@ -47,6 +47,18 @@
             <option value="16">特大</option>
           </select>
         </label>
+        <label class="switch-row">
+          <span><strong>FOMO 持仓占比</strong><small>FOMO 统计卡及 GMGN 合约地址后显示 ≥X%</small></span>
+          <input id="show-holding-share" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span><strong>FOMO 热门代币</strong><small>主动打开热门标签时才请求</small></span>
+          <input id="show-trending" type="checkbox" />
+        </label>
+        <label class="switch-row">
+          <span><strong>KOL 排名标识</strong><small id="rank-note">连接 985monitor 且有排名数据时显示</small></span>
+          <input id="show-kol-rank" type="checkbox" />
+        </label>
         <label class="select-row">
           <span><strong>自动刷新</strong><small>最短 2 分钟；限流时自动等待</small></span>
           <select id="refresh-seconds">

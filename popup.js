@@ -6,6 +6,9 @@ const DEFAULTS = {
   fdRefreshSeconds: 120,
   fdFeedEnabled: false,
   fdThesisFontSize: 12,
+  fdShowHoldingShare: true,
+  fdShowTrending: true,
+  fdShowKolRank: true,
 };
 
 const elements = {
@@ -22,6 +25,10 @@ const elements = {
   openMonitor: document.querySelector('#open-monitor'),
   resetLayout: document.querySelector('#reset-layout'),
   version: document.querySelector('#version'),
+  share: document.querySelector('#show-holding-share'),
+  trending: document.querySelector('#show-trending'),
+  kolRank: document.querySelector('#show-kol-rank'),
+  rankNote: document.querySelector('#rank-note'),
 };
 
 function formatExpiry(expiry) {
@@ -51,6 +58,7 @@ function renderMonitor(state) {
     ? `已连接 ${state.displayName || '985monitor'}；按网页关注与屏蔽配置过滤`
     : '默认关闭；开启前请先登录一次 985monitor';
   elements.openMonitor.textContent = connected ? '打开 985monitor' : '连接 985monitor';
+  elements.rankNote.textContent = connected ? '读取 985monitor 排名；无数据时不显示' : '未连接 985monitor，排名自动隐藏';
 }
 
 async function init() {
@@ -60,11 +68,18 @@ async function init() {
   elements.enabled.checked = stored.fdEnabled;
   elements.showPnl.checked = stored.fdShowPnl;
   elements.feedEnabled.checked = stored.fdFeedEnabled;
+  elements.share.checked = stored.fdShowHoldingShare;
+  elements.trending.checked = stored.fdShowTrending;
+  elements.kolRank.checked = stored.fdShowKolRank;
   elements.thesisFontSize.value = String(stored.fdThesisFontSize);
   elements.refresh.value = String(Number(stored.fdRefreshSeconds) >= 300 ? 300 : 120);
   elements.version.textContent = `v${chrome.runtime.getManifest().version}`;
   renderSession(stored.fomoToken);
   renderMonitor(stored.monitor985SyncStateV1);
+}
+
+for (const [element, key] of [[elements.share, 'fdShowHoldingShare'], [elements.trending, 'fdShowTrending'], [elements.kolRank, 'fdShowKolRank']]) {
+  element.addEventListener('change', () => chrome.storage.local.set({ [key]: element.checked }));
 }
 
 elements.enabled.addEventListener('change', () => {

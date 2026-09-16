@@ -104,6 +104,34 @@ test('parallel tabs coalesce identical requests; cached list expires after 90 se
   assert.equal(h.calls.length, 2);
 });
 
+test('trending is POST-only, coalesced and shares the official API queue and cooldown', async () => {
+  const item = { token: { networkId: 5042, address, symbol: 'ARC' }, marketCap: 100, change24: 0.12 };
+  const h = harness({ responses: [reply(), reply(200, { responseObject: [item, item] }), reply(429)] });
+  await h.context.fetchTokenData(payload);
+  const a = h.context.fetchFomoTrending();
+  const b = h.context.fetchFomoTrending();
+  await h.advance(1500);
+  assert.equal((await a).items.length, 1);
+  assert.equal((await b).items[0].chain, 'arc');
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.calls[1].init.method, 'POST');
+  assert.match(h.calls[1].url, /\/proxy\/trendingTokens$/);
+  await h.advance(90_000);
+  const cached = await h.context.fetchFomoTrending();
+  assert.equal(cached.stale, true);
+  assert.equal(cached.items.length, 1);
+  assert.equal(cached.retryAfterMs, 300_000);
+});
+
+test('trending validates network, address, image scheme and nullable metrics', () => {
+  const h = harness();
+  const make = (networkId, addr) => ({ token: { networkId, address: addr, symbol: '<script>', info: { imageSmallUrl: 'javascript:alert(1)' } }, priceUSD: null });
+  const items = h.context.compactTrending([make(56, address), make(999, address), make(5042, 'bad'), make(1399811149, address)]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].price, null);
+  assert.equal(items[0].image, '');
+});
+
 test('holders, thesis, swaps and PnL share serial 1.5 second spacing', async () => {
   const h = harness();
   const requests = [
