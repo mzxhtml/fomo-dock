@@ -1,18 +1,34 @@
 'use strict';
 
 const FOMO_API = 'https://prod-api.fomo.family';
-const SUPPORTED_CHAINS = '1,56,143,4663,8453,1399811149';
+const SUPPORTED_CHAINS = '1,56,143,4663,5042,8453,1399811149';
 const KEEPALIVE_ALARM = 'fomo-dock-keepalive';
-const KEEPER_URL = 'https://fomo.family/?fomo_dock_keeper=1';
-const CACHE_TTL_MS = 20_000;
+const EXPIRY_ALARM = 'fomo-dock-expiry';
+const KEEPER_URL = 'https://fomo.family/token?fomo_dock_keeper=1';
+const KEEPER_STATE_KEY = 'fdFomoKeeperTabsV1';
+const RECOVERY_STATE_KEY = 'fdFomoRecoveryV1';
+const SESSION_RETRY_MS = 5 * 60_000;
+const CACHE_TTL_MS = 90_000;
 const CACHE_LIMIT = 80;
 const REFRESH_AHEAD_MS = 20 * 60_000;
 
 const responseCache = new Map();
 const pnlCache = new Map();
+const tokenRequests = new Map();
+const pnlRequests = new Map();
+const FOMO_REQUEST_GAP_MS = 1500;
+const FOMO_RATE_LIMIT_KEY = 'fdFomoRateLimitV1';
+const FOMO_BACKOFF_BASE_MS = 5 * 60_000;
+const FOMO_BACKOFF_MAX_MS = 30 * 60_000;
+let fomoRequestTail = Promise.resolve();
+let fomoNextRequestAt = 0;
+let fomoRateLimit = { until: 0, level: 0 };
+let fomoRateLimitReady = null;
 let keepAliveAt = 0;
 let refreshInFlight = null;
 let sessionOwnerQueue = Promise.resolve();
+let sessionMirrorQueue = Promise.resolve();
+const releasedKeeperIds = new Set();
 
 // 985monitor 只向扩展签发读取 FOMO 推送的只读会话。
 const MONITOR985_ORIGIN = 'https://www.985monitor.xyz';
@@ -28,6 +44,7 @@ const FOMO_FEED_TYPE = {
 const FOMO_CHAIN_SLUG = {
   bnb: 'bsc', bsc: 'bsc', sol: 'sol', solana: 'sol', eth: 'eth', ethereum: 'eth',
   base: 'base', robinhood: 'robinhood', 'chain 143': 'monad', monad: 'monad',
+  arc: 'arc', chain5042: 'arc', 'chain 5042': 'arc',
 };
 let monitor985ConfigInflight = null;
 let fomoFeedCache = { events: [], updatedAt: 0, fetchedAt: 0 };
@@ -35,10 +52,117 @@ let fomoFeedEtag = '';
 let fomoFeedFailCount = 0;
 let fomoFeedBackoffUntil = 0;
 let fomoFeedInflight = null;
+const MONITOR_SYNC_KEY = 'fdMonitorSyncV1';
+let monitorWriteTail = Promise.resolve();
+
+function monitorTransaction(run) {
+  const task = monitorWriteTail.then(run);
+  monitorWriteTail = task.catch(() => {});
+  return task;
+}
+
+function monitorAccount(value) {
+  const text = String(value || '').trim();
+  return /^0x/i.test(text) ? text.toLowerCase() : text;
+}
+
+function monitorSender(sender) {
+  try {
+    const url = new URL(sender?.url || sender?.tab?.url);
+    return sender?.id === chrome.runtime.id && Number.isInteger(sender?.tab?.id)
+      && (!sender.frameId || sender.frameId === 0) && url.protocol === 'https:'
+      && /(^|\.)985monitor\.xyz$/.test(url.hostname);
+  } catch { return false; }
+}
+
+async function monitorSessionIsCurrent(session) {
+  const stored = await chrome.storage.local.get('monitor985SessionV1');
+  return (stored.monitor985SessionV1?.token || '') === (session?.token || '');
+}
+
+function monitorConfigPatch(config, session) {
+  const at = Date.now();
+  return {
+    monitorFomoConfig: { ...(config.fomo || {}), wallet: config.account.userId,
+      connected: true, revision: config.revision, at },
+    monitor985SyncStateV1: { connected: true, accountId: config.account.userId,
+      displayName: String(config.account.displayName || ''), syncedAt: at,
+      expiresAt: Number(session?.expiresAt || config.sessionExpiresAt) || 0 },
+  };
+}
+
+function acquireMonitorSync(message, sender) {
+  if (!monitorSender(sender)) return Promise.resolve({ ok: false });
+  return monitorTransaction(async () => {
+    const now = Date.now();
+    const state = (await chrome.storage.session.get(MONITOR_SYNC_KEY))[MONITOR_SYNC_KEY] || {};
+    if (state.retryAt > now || state.expiresAt > now) return { ok: false, reason: 'busy' };
+    const stored = await chrome.storage.local.get({ monitor985SessionV1: null, monitor985ClientIdV1: '' });
+    const session = stored.monitor985SessionV1;
+    const account = monitorAccount(message.account);
+    if (!account || account.length > 200) return { ok: false };
+    const sameAccount = monitorAccount(session?.accountId) === account;
+    if (session?.token && session.expiresAt > now && !sameAccount && message.visible !== true) {
+      return { ok: false, reason: 'background-account' };
+    }
+    const needsRebind = !sameAccount || !session?.token || !(session.expiresAt > now + 24 * 60 * 60_000);
+    const prefsStamp = String(message.prefsStamp || '').slice(0, 200_000);
+    if (!needsRebind && state.prefsStamp === prefsStamp && state.account === account
+      && now - Number(state.syncedAt || 0) < MONITOR985_CONFIG_TTL_MS) return { ok: false, reason: 'fresh' };
+    const clientId = stored.monitor985ClientIdV1 || crypto.randomUUID();
+    if (!stored.monitor985ClientIdV1) await chrome.storage.local.set({ monitor985ClientIdV1: clientId });
+    const lease = crypto.randomUUID();
+    await chrome.storage.session.set({ [MONITOR_SYNC_KEY]: {
+      ...state, lease, tabId: sender.tab.id, expiresAt: now + 30_000,
+      account, pendingPrefs: prefsStamp, baseToken: session?.token || '', clientId, needsRebind,
+    } });
+    return { ok: true, lease, clientId, needsRebind };
+  });
+}
+
+function finishMonitorSync(message, sender) {
+  if (!monitorSender(sender)) return Promise.resolve({ ok: false });
+  return monitorTransaction(async () => {
+    const state = (await chrome.storage.session.get(MONITOR_SYNC_KEY))[MONITOR_SYNC_KEY];
+    if (!state || state.lease !== message.lease || state.tabId !== sender.tab.id || state.expiresAt <= Date.now()) {
+      return { ok: false, reason: 'stale-lease' };
+    }
+    const stored = await chrome.storage.local.get('monitor985SessionV1');
+    const current = stored.monitor985SessionV1;
+    const stillCurrent = (current?.token || '') === state.baseToken;
+    const config = message.body?.config;
+    const incoming = message.body?.session;
+    const validConfig = config?.connected === true && monitorAccount(config.account?.userId) === state.account;
+    let active = current;
+    if (incoming?.token && Number(incoming.expiresAt) > Date.now()) {
+      active = { token: incoming.token, expiresAt: Number(incoming.expiresAt),
+        clientId: incoming.clientId || state.clientId, accountId: config?.account?.userId };
+    }
+    const ok = stillCurrent && message.status >= 200 && message.status < 300 && message.body?.ok === true && validConfig
+      && active?.token && Number(active.expiresAt) > Date.now()
+      && (!state.needsRebind || Boolean(incoming?.token));
+    if (ok) {
+      await chrome.storage.local.set({ monitor985SessionV1: active, ...monitorConfigPatch(config, active) });
+      if (active.token !== state.baseToken) resetFomoFeedCache();
+    } else if (stillCurrent && message.status === 401 && !(current?.token && current.expiresAt > Date.now())) {
+      await chrome.storage.local.set({ monitorFomoConfig: { connected: false, at: Date.now() },
+        monitor985SyncStateV1: { connected: false, reason: 'login-required', checkedAt: Date.now() } });
+    }
+    const delay = Number(message.retryAfterMs);
+    const retryMs = ok || message.cancelled ? 0
+      : Math.max(message.status === 429 ? 60_000 : 30_000, Number.isFinite(delay) ? Math.min(delay, 86_400_000) : 0);
+    // Persist the shared cooldown and remove the lease's session snapshot.
+    await chrome.storage.session.set({ [MONITOR_SYNC_KEY]: {
+      account: state.account, syncedAt: ok ? Date.now() : state.syncedAt || 0,
+      prefsStamp: ok ? state.pendingPrefs : state.prefsStamp || '', retryAt: Date.now() + retryMs,
+    } });
+    return { ok: Boolean(ok), reason: stillCurrent ? undefined : 'session-changed' };
+  });
+}
 
 async function monitor985Session() {
   const { monitor985SessionV1: session } = await chrome.storage.local.get({ monitor985SessionV1: null });
-  if (!session?.token || Number(session.expiresAt) <= Date.now()) return null;
+  if (!session?.token || !(Number(session.expiresAt) > Date.now())) return null;
   return session;
 }
 
@@ -49,33 +173,28 @@ function resetFomoFeedCache() {
   fomoFeedBackoffUntil = 0;
 }
 
-async function markMonitor985Disconnected(reason, clearSession = false) {
-  resetFomoFeedCache();
-  const patch = {
-    monitorFomoConfig: { connected: false, at: Date.now() },
-    monitor985SyncStateV1: { connected: false, reason, checkedAt: Date.now() },
-  };
-  if (clearSession) patch.monitor985SessionV1 = null;
-  await chrome.storage.local.set(patch);
+function markMonitor985Disconnected(reason, clearSession = false, session = null) {
+  return monitorTransaction(async () => {
+    if (!await monitorSessionIsCurrent(session)) return false;
+    const sync = (await chrome.storage.session.get(MONITOR_SYNC_KEY))[MONITOR_SYNC_KEY];
+    if (sync?.expiresAt > Date.now() && sync.baseToken === (session?.token || '')) return false;
+    resetFomoFeedCache();
+    const patch = {
+      monitorFomoConfig: { connected: false, at: Date.now() },
+      monitor985SyncStateV1: { connected: false, reason, checkedAt: Date.now() },
+    };
+    if (clearSession) patch.monitor985SessionV1 = null;
+    await chrome.storage.local.set(patch);
+    return true;
+  });
 }
 
-async function applyMonitor985Config(config, session) {
-  if (!config?.connected || !config?.account?.userId) return false;
-  const at = Date.now();
-  await chrome.storage.local.set({
-    monitorFomoConfig: {
-      ...(config.fomo || {}), wallet: config.account.userId,
-      connected: true, revision: config.revision, at,
-    },
-    monitor985SyncStateV1: {
-      connected: true,
-      accountId: config.account.userId,
-      displayName: String(config.account.displayName || ''),
-      syncedAt: at,
-      expiresAt: Number(session?.expiresAt || config.sessionExpiresAt) || 0,
-    },
+function applyMonitor985Config(config, session) {
+  return monitorTransaction(async () => {
+    if (!config?.connected || !config?.account?.userId || !await monitorSessionIsCurrent(session)) return false;
+    await chrome.storage.local.set(monitorConfigPatch(config, session));
+    return true;
   });
-  return true;
 }
 
 async function refreshMonitor985Config(force = false) {
@@ -83,8 +202,8 @@ async function refreshMonitor985Config(force = false) {
   monitor985ConfigInflight = (async () => {
     const stored = await chrome.storage.local.get({ monitor985SessionV1: null, monitor985SyncStateV1: null });
     const session = stored.monitor985SessionV1;
-    if (!session?.token || Number(session.expiresAt) <= Date.now()) {
-      await markMonitor985Disconnected('login-required', Boolean(session));
+    if (!session?.token || !(Number(session.expiresAt) > Date.now())) {
+      await markMonitor985Disconnected('login-required', Boolean(session), session);
       return false;
     }
     if (!force && stored.monitor985SyncStateV1?.connected
@@ -92,11 +211,11 @@ async function refreshMonitor985Config(force = false) {
     try {
       const response = await fetch(MONITOR985_CONFIG_URL, {
         headers: { Accept: 'application/json', Authorization: `Bearer ${session.token}` },
-        cache: 'no-store',
+        cache: 'no-store', signal: AbortSignal.timeout(20_000),
       });
       const body = await response.json().catch(() => null);
       if (response.status === 401) {
-        await markMonitor985Disconnected('unauthorized', true);
+        await markMonitor985Disconnected('unauthorized', true, session);
         return false;
       }
       if (!response.ok || body?.ok !== true || !body?.config) throw new Error(`HTTP ${response.status}`);
@@ -133,55 +252,68 @@ function slimFomoEvent(raw) {
   };
 }
 
-async function fetchFomoFeed() {
+function fetchFomoFeed() {
   if (fomoFeedInflight) return fomoFeedInflight;
+  fomoFeedInflight = fetchFomoFeedOnce().finally(() => { fomoFeedInflight = null; });
+  return fomoFeedInflight;
+}
+
+async function fetchFomoFeedOnce() {
+  await refreshMonitor985Config(false);
   const session = await monitor985Session();
   if (!session) return { ok: false, reason: 'not-connected', events: [] };
-  await refreshMonitor985Config(false);
   const now = Date.now();
   if (now - fomoFeedCache.fetchedAt < FOMO_FEED_MIN_INTERVAL_MS || now < fomoFeedBackoffUntil) {
     return { ok: true, ...fomoFeedCache, stale: true };
   }
-  fomoFeedInflight = (async () => {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25_000);
+    const headers = { Authorization: 'Bearer ' + session.token };
+    if (fomoFeedEtag) headers['If-None-Match'] = fomoFeedEtag;
+    let response;
+    let body;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 25_000);
-      const headers = { Authorization: `Bearer ${session.token}` };
-      if (fomoFeedEtag) headers['If-None-Match'] = fomoFeedEtag;
-      let response;
-      try {
-        response = await fetch(FOMO_FEED_URL, { headers, cache: 'no-store', signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
+      response = await fetch(FOMO_FEED_URL, { headers, cache: 'no-store', signal: controller.signal });
+      body = response.status === 304 ? null : await response.json().catch(() => null);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (response.status === 401) {
+      const changed = await markMonitor985Disconnected('unauthorized', true, session);
+      return { ok: false, reason: changed ? 'not-connected' : 'session-changed', events: [] };
+    }
+    return await monitorTransaction(async () => {
+      if (!await monitorSessionIsCurrent(session)) return { ok: false, reason: 'session-changed', events: [] };
       if (response.status === 304) {
         fomoFeedCache.fetchedAt = Date.now();
         fomoFeedFailCount = 0;
         return { ok: true, ...fomoFeedCache };
       }
-      if (response.status === 401) {
-        await markMonitor985Disconnected('unauthorized', true);
-        return { ok: false, reason: 'not-connected', events: [] };
+      if (!response.ok) {
+        const error = new Error('Feed request failed');
+        if (response.status === 429) error.retryAfterMs = retryAfterMs(response, Date.now());
+        throw error;
       }
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const body = await response.json();
-      const events = (Array.isArray(body?.events) ? body.events : [])
-        .map(slimFomoEvent).filter(Boolean).sort((a, b) => b.ts - a.ts).slice(0, FOMO_FEED_KEEP);
-      fomoFeedCache = { events, updatedAt: Number(body?.updatedAt) || Date.now(), fetchedAt: Date.now() };
+      if (!body || !Array.isArray(body.events)) throw new Error('Invalid feed response');
+      const events = body.events.map(slimFomoEvent).filter(Boolean)
+        .sort((a, b) => b.ts - a.ts).slice(0, FOMO_FEED_KEEP);
+      fomoFeedCache = { events, updatedAt: Number(body.updatedAt) || Date.now(), fetchedAt: Date.now() };
       fomoFeedEtag = response.headers.get('ETag') || '';
       fomoFeedFailCount = 0;
       fomoFeedBackoffUntil = 0;
       return { ok: true, ...fomoFeedCache };
-    } catch (error) {
+    });
+  } catch (error) {
+    return monitorTransaction(async () => {
+      if (!await monitorSessionIsCurrent(session)) return { ok: false, reason: 'session-changed', events: [] };
       fomoFeedFailCount += 1;
-      fomoFeedBackoffUntil = Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** (fomoFeedFailCount - 1));
+      const delay = Math.min(15 * 60_000, 60_000 * 2 ** (fomoFeedFailCount - 1));
+      fomoFeedBackoffUntil = Date.now() + Math.max(delay, Number(error.retryAfterMs) || 0);
       if (fomoFeedCache.events.length) return { ok: true, ...fomoFeedCache, stale: true };
       return { ok: false, reason: 'fetch-failed', message: String(error?.message || '').slice(0, 120) };
-    } finally {
-      fomoFeedInflight = null;
-    }
-  })();
-  return fomoFeedInflight;
+    });
+  }
 }
 
 function jwtExpiry(token) {
@@ -214,159 +346,352 @@ function firstObjectArray(value, depth = 0) {
   return null;
 }
 
+function fomoTabUrl(tab) {
+  try {
+    const url = new URL(tab.pendingUrl || tab.url);
+    return url.origin === 'https://fomo.family' ? url : null;
+  } catch { return null; }
+}
+
 async function fomoTabs() {
-  try {
-    return await chrome.tabs.query({
-      url: ['https://fomo.family/*', 'https://*.fomo.family/*'],
-    });
-  } catch {
-    return [];
+  // Include pending navigations. A query error is not proof that no tab exists.
+  return (await chrome.tabs.query({})).filter((tab) => fomoTabUrl(tab));
+}
+
+// Runs in FOMO's MAIN world. Use the page's existing Privy provider; return only
+// status and expiry, never access/refresh tokens through DOM or page messages.
+async function pageSdkAccess(renew = false) {
+  if (location.origin !== 'https://fomo.family') return { status: 'wrong-origin' };
+  const nodes = [document.body, ...document.querySelectorAll('body > *, #root > *, #app > *, header, main')].slice(0, 24);
+  const seen = new Set();
+  for (const node of nodes) {
+    let fiber = Object.entries(node || {}).find(([key]) => key.startsWith('__reactFiber$'))?.[1];
+    for (let depth = 0; fiber && depth < 120; depth++, fiber = fiber.return) {
+      if (seen.has(fiber)) break;
+      seen.add(fiber);
+      const sdk = fiber.memoizedProps?.value;
+      if (!sdk || typeof sdk.getAccessToken !== 'function' || typeof sdk.login !== 'function'
+        || typeof sdk.logout !== 'function' || typeof sdk.ready !== 'boolean') continue;
+      if (!sdk.ready) return { status: 'not-ready' };
+      if (!sdk.authenticated) return { status: 'signed-out' };
+      if (!renew) return { status: 'ready' };
+      try {
+        const token = await sdk.getAccessToken();
+        const part = String(token).split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        const exp = Number(JSON.parse(atob(part)).exp) * 1000;
+        return { status: exp > Date.now() ? 'renewed' : 'expired', exp };
+      } catch { return { status: 'sdk-error' }; }
+    }
   }
+  return { status: 'sdk-missing' };
 }
 
-function isKeeperTab(tab) {
-  return String(tab?.url || '').includes('fomo_dock_keeper=');
-}
-
-async function dedupeKeeperTabs(tabs = null) {
-  const allTabs = Array.isArray(tabs) ? tabs : await fomoTabs();
-  const keepers = allTabs
-    .filter(isKeeperTab)
-    .sort((a, b) => Number(a.id) - Number(b.id));
-  if (keepers.length < 2) return keepers[0] || null;
-
-  // Prefer the tab the user is currently viewing; otherwise keep the oldest
-  // non-discarded keeper so parallel checks always select the same owner.
-  const owner = keepers.find((tab) => tab.active && !tab.discarded)
-    || keepers.find((tab) => !tab.discarded)
-    || keepers[0];
-  const extras = keepers
-    .filter((tab) => tab.id !== owner.id)
-    .map((tab) => tab.id)
-    .filter(Number.isInteger);
-  if (extras.length) await chrome.tabs.remove(extras).catch(() => {});
-  return owner;
-}
-
-async function pageIsAlive() {
-  const { fomoPage } = await chrome.storage.local.get('fomoPage');
-  return Boolean(fomoPage?.at && Date.now() - fomoPage.at < 45_000);
-}
-
-async function ensureSessionOwnerUnlocked(dedicated = false) {
+function pageWasKeeper() {
   try {
-    const tabs = await fomoTabs();
-    let owner = await dedupeKeeperTabs(tabs);
-    let created = false;
-    if (!owner && !dedicated) {
-      owner = tabs.find((tab) => !tab.discarded && tab.status === 'complete')
-        || tabs.find((tab) => !tab.discarded);
-    }
-    if (!owner) {
-      owner = await chrome.tabs.create({ url: KEEPER_URL, active: false, pinned: true });
-      created = true;
-    }
-    const isKeeper = isKeeperTab(owner);
-    const wasDiscarded = Boolean(owner.discarded);
-    await chrome.tabs.update(owner.id, {
-      autoDiscardable: false,
-      ...(isKeeper ? { pinned: true } : {}),
-    });
-    if (wasDiscarded || (dedicated && isKeeper && !created)) {
-      await chrome.tabs.reload(owner.id);
-    }
-    return owner;
-  } catch {
-    return null;
-  }
+    const initial = new URL(performance.getEntriesByType('navigation')[0]?.name);
+    return initial.origin === 'https://fomo.family' && initial.searchParams.get('fomo_dock_keeper') === '1';
+  } catch { return false; }
 }
 
-function ensureSessionOwner(dedicated = false) {
-  const task = sessionOwnerQueue.then(() => ensureSessionOwnerUnlocked(dedicated));
-  // Keep later checks serialized even if a Chrome tabs operation fails.
+async function runFomoScript(details, timeoutMs = 5000) {
+  let timer;
+  try {
+    return await Promise.race([
+      chrome.scripting.executeScript(details),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+
+async function sdkAccess(tabId, renew = false) {
+  const result = await runFomoScript({ target: { tabId }, world: 'MAIN', func: pageSdkAccess, args: [renew] }, renew ? 12_000 : 5000);
+  return result?.[0]?.result || { status: 'page-unavailable' };
+}
+
+function serializeOwner(run) {
+  const task = sessionOwnerQueue.then(run);
   sessionOwnerQueue = task.catch(() => null);
   return task;
 }
 
-async function waitForMirroredToken(previous, timeoutMs = 35_000) {
-  const attempts = Math.max(1, Math.ceil(timeoutMs / 1000));
-  for (let i = 0; i < attempts; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const { fomoToken } = await chrome.storage.local.get('fomoToken');
-    if (fomoToken?.token && fomoToken.token !== previous) return fomoToken;
+async function ensureSessionOwnerUnlocked() {
+  const tabs = await fomoTabs();
+  const saved = (await chrome.storage.session.get(KEEPER_STATE_KEY))[KEEPER_STATE_KEY] || {};
+  const liveIds = new Set(tabs.map((tab) => tab.id));
+  const checked = new Set((saved.checked || []).filter((id) => liveIds.has(id)));
+  const owned = new Set((saved.owned || []).filter((id) => !releasedKeeperIds.has(id) && tabs.some((tab) => tab.id === id && tab.pinned)));
+  const save = () => chrome.storage.session.set({ [KEEPER_STATE_KEY]: { owned: [...owned], checked: [...checked] } });
+  for (const tab of tabs) {
+    if (releasedKeeperIds.has(tab.id)) { checked.add(tab.id); continue; }
+    if (owned.has(tab.id) || !tab.pinned) { checked.add(tab.id); continue; }
+    if (checked.has(tab.id)) continue;
+    let wasKeeper = fomoTabUrl(tab).searchParams.get('fomo_dock_keeper') === '1';
+    if (!wasKeeper && !tab.discarded) {
+      const result = await runFomoScript({ target: { tabId: tab.id }, func: pageWasKeeper });
+      if (typeof result?.[0]?.result !== 'boolean') continue;
+      wasKeeper = result[0].result;
+    }
+    if (tab.discarded && !wasKeeper) continue;
+    checked.add(tab.id);
+    if (wasKeeper) owned.add(tab.id);
   }
-  return null;
+  await save();
+  const isApp = (tab) => /^\/(token|tokens|profile)(?:\/|$)/.test(fomoTabUrl(tab)?.pathname || '');
+  const keepers = tabs.filter((tab) => owned.has(tab.id)).sort((a, b) => a.id - b.id);
+  const userApps = tabs.filter((tab) => !owned.has(tab.id) && isApp(tab))
+    .sort((a, b) => Number(b.active) - Number(a.active));
+  let owner;
+  let ready = false;
+  for (const tab of userApps.filter((tab) => !tab.discarded).slice(0, 3)) {
+    if ((await sdkAccess(tab.id)).status === 'ready') { owner = tab; ready = true; break; }
+  }
+  // Loading, signed-out, or SDK-missing pages are reused instead of spawning more.
+  owner ||= keepers.find((tab) => !tab.discarded) || keepers[0]
+    || userApps.find((tab) => !tab.discarded) || userApps[0];
+  if (!owner) {
+    owner = await chrome.tabs.create({ url: KEEPER_URL, active: false, pinned: true });
+    owned.add(owner.id);
+    checked.add(owner.id);
+    await save(); // Save before an SPA can remove the URL marker.
+  }
+  owner = await chrome.tabs.get(owner.id);
+  if (!fomoTabUrl(owner)) return null;
+  if (releasedKeeperIds.has(owner.id) || !owner.pinned) owned.delete(owner.id);
+  const discarded = Boolean(owner.discarded);
+  const migrate = owned.has(owner.id) && owner.pinned && fomoTabUrl(owner).pathname === '/';
+  owner = await chrome.tabs.update(owner.id, { autoDiscardable: false, ...(migrate ? { url: KEEPER_URL } : {}) });
+  if (discarded && !migrate) await chrome.tabs.reload(owner.id);
+  if (migrate || discarded) ready = false;
+  else if (!ready) ready = (await sdkAccess(owner.id)).status === 'ready';
+  // Cleanup needs a usable replacement and fresh ownership checks. Active,
+  // unpinned, and user-created tabs must never be removed.
+  if (ready && isApp(owner)) {
+    for (const tab of keepers) {
+      if (tab.id === owner.id) continue;
+      try {
+        const replacement = await chrome.tabs.get(owner.id);
+        if (!isApp(replacement) || replacement.discarded) break;
+        const extra = await chrome.tabs.get(tab.id);
+        if (releasedKeeperIds.has(tab.id) || !extra.pinned || !fomoTabUrl(extra)) { owned.delete(tab.id); continue; }
+        if (extra.active) continue;
+        await chrome.tabs.remove(tab.id);
+        owned.delete(tab.id);
+        checked.delete(tab.id);
+      } catch { /* A concurrent tab close/navigation is harmless. */ }
+    }
+    await save();
+  }
+  return owner;
+}
+
+function ensureSessionOwner() {
+  return serializeOwner(ensureSessionOwnerUnlocked).catch(() => null);
+}
+
+function releaseKeeper(tabId, removed = false, takeover = false) {
+  if (takeover) releasedKeeperIds.add(tabId);
+  return serializeOwner(async () => {
+    const saved = (await chrome.storage.session.get(KEEPER_STATE_KEY))[KEEPER_STATE_KEY] || {};
+    if (!takeover && !saved.owned?.includes(tabId) && !saved.checked?.includes(tabId)) return;
+    const owned = (saved.owned || []).filter((id) => id !== tabId);
+    const checked = new Set(saved.checked || []);
+    if (removed) checked.delete(tabId);
+    else checked.add(tabId); // Unpinning hands the page to the user, even if repinned.
+    await chrome.storage.session.set({ [KEEPER_STATE_KEY]: { owned, checked: [...checked] } });
+    if (removed) releasedKeeperIds.delete(tabId);
+  });
 }
 
 async function refreshSession() {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const { fomoToken } = await chrome.storage.local.get('fomoToken');
-    if (!fomoToken?.refresh) return null;
-    const owner = await ensureSessionOwner(!(await pageIsAlive()));
-    if (!owner) return null;
-    const mirrored = await waitForMirroredToken(fomoToken.token);
-    if (mirrored) return mirrored;
-    const latest = (await chrome.storage.local.get('fomoToken')).fomoToken || null;
-    return latest?.token && Number(latest.exp) > Date.now() ? latest : null;
+    const stored = await chrome.storage.local.get({ fdEnabled: true, fomoToken: null, [RECOVERY_STATE_KEY]: null });
+    const token = stored.fomoToken;
+    if (!stored.fdEnabled || !token?.token) return null;
+    const usable = (value) => value?.token && Number(value.exp) > Date.now() ? value : null;
+    const prior = stored[RECOVERY_STATE_KEY];
+    if (prior?.tokenExp === token.exp && prior.retryAt > Date.now()) return usable(token);
+    const state = { tokenExp: token.exp, retryAt: Date.now() + SESSION_RETRY_MS, status: 'waiting-sdk' };
+    // Persist the attempt before opening a page, including across worker restarts.
+    await chrome.storage.local.set({ [RECOVERY_STATE_KEY]: state });
+    const owner = await ensureSessionOwner();
+    let result = { status: 'page-unavailable' };
+    if (owner) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        result = await sdkAccess(owner.id);
+        if (result.status === 'ready') { result = await sdkAccess(owner.id, true); break; }
+        if (!['not-ready', 'sdk-missing'].includes(result.status)) break;
+        if (attempt < 7) await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      if (result.status === 'renewed') {
+        await runFomoScript({ target: { tabId: owner.id }, files: ['fomo-auth.js'] });
+        await chrome.tabs.sendMessage(owner.id, { type: 'fomo-sync-now' }).catch(() => {});
+      }
+    }
+    let latest = (await chrome.storage.local.get('fomoToken')).fomoToken || null;
+    if (result.status === 'renewed') {
+      for (let attempt = 0; attempt < 5 && (!usable(latest) || Number(latest.exp) < result.exp); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        latest = (await chrome.storage.local.get('fomoToken')).fomoToken || null;
+      }
+    }
+    const recovered = result.status === 'renewed' && usable(latest) && Number(latest.exp) >= result.exp;
+    await chrome.storage.local.set({ [RECOVERY_STATE_KEY]: {
+      ...state, tokenExp: latest?.exp ?? token.exp,
+      status: recovered ? 'ready' : result.status,
+      retryAt: recovered ? Math.max(Date.now() + 30_000, Math.min(state.retryAt, latest.exp - 30_000)) : state.retryAt,
+    } });
+    return usable(latest);
   })().catch(() => null);
-  try {
-    return await refreshInFlight;
-  } finally {
-    refreshInFlight = null;
-  }
+  try { return await refreshInFlight; }
+  finally { refreshInFlight = null; }
+}
+
+async function scheduleSessionExpiry() {
+  const { fomoToken, fdEnabled } = await chrome.storage.local.get(['fomoToken', 'fdEnabled']);
+  const exp = Number(fomoToken?.exp) || 0;
+  if (fdEnabled === false || exp <= Date.now()) { await chrome.alarms.clear(EXPIRY_ALARM); return; }
+  const when = Math.max(Date.now() + 30_000, exp - 30_000);
+  const prior = await chrome.alarms.get(EXPIRY_ALARM);
+  if (!prior || Math.abs(prior.scheduledTime - when) > 2000) await chrome.alarms.create(EXPIRY_ALARM, { when });
 }
 
 async function keepSessionAlive(force = false) {
   if (!force && Date.now() - keepAliveAt < 60_000) return;
   keepAliveAt = Date.now();
-  const { fomoToken } = await chrome.storage.local.get('fomoToken');
-  if (!fomoToken?.refresh) return;
+  const { fdEnabled, fomoToken } = await chrome.storage.local.get(['fdEnabled', 'fomoToken']);
+  if (fdEnabled === false || !fomoToken?.token) return;
   const left = (Number(fomoToken.exp) || jwtExpiry(fomoToken.token)) - Date.now();
-  if (!force && left > REFRESH_AHEAD_MS) return;
-
-  const owner = await ensureSessionOwner(false);
-  if (!owner) return;
-  if (await pageIsAlive()) {
-    if (force) await refreshSession();
-    return;
-  }
-  await ensureSessionOwner(true);
-  if (force) await refreshSession();
+  if (left > REFRESH_AHEAD_MS) return;
+  await refreshSession();
 }
 
 function bodyIsUnauthorized(body) {
   const status = Number(body?.statusCode);
-  return status === 401 || status === 403;
+  const message = `${body?.error || ''} ${body?.message || ''}`;
+  return status === 401 || status === 403 || /\bunauthori[sz]ed\b|\bunauthenticated\b/i.test(message);
+}
+
+function loadFomoRateLimit() {
+  if (!fomoRateLimitReady) {
+    fomoRateLimitReady = chrome.storage.local.get(FOMO_RATE_LIMIT_KEY).then((stored) => {
+      const state = stored[FOMO_RATE_LIMIT_KEY];
+      const until = Number(state?.until);
+      const level = Number(state?.level);
+      fomoRateLimit = {
+        until: Number.isFinite(until) ? Math.max(0, until) : 0,
+        level: Number.isFinite(level) ? Math.max(0, Math.min(4, Math.trunc(level))) : 0,
+      };
+    }).catch(() => {});
+  }
+  return fomoRateLimitReady;
+}
+
+function checkFomoRateLimit() {
+  if (Date.now() < fomoRateLimit.until) {
+    const error = new Error('FOMO 请求暂时受限');
+    error.reason = 'rate-limited';
+    error.retryAt = fomoRateLimit.until;
+    throw error;
+  }
+}
+
+function retryAfterMs(response, now) {
+  const value = String(response.headers.get('Retry-After') || '').trim();
+  if (/^\d+(?:\.\d+)?$/.test(value)) {
+    const delay = Number(value) * 1000;
+    return Number.isFinite(delay) ? delay : 0;
+  }
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now) : 0;
+}
+
+// All official FOMO API calls, including PnL and auth retries, share one queue.
+// Consume the body before releasing the slot; a slow response cannot overlap
+// the next request. Cooldown survives service-worker and browser restarts.
+async function queuedFomoFetch(path, token) {
+  await loadFomoRateLimit();
+  checkFomoRateLimit();
+  const task = fomoRequestTail.then(async () => {
+    checkFomoRateLimit();
+    const wait = Math.max(0, fomoNextRequestAt - Date.now());
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    checkFomoRateLimit();
+    const headers = { Accept: 'application/json', 'X-Supported-Chains': SUPPORTED_CHAINS };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25_000);
+    try {
+      const response = await fetch(`${FOMO_API}${path}`, {
+        headers, credentials: 'include', cache: 'no-store', signal: controller.signal,
+      });
+      if (response.status === 429) {
+        const now = Date.now();
+        const previousLevel = now - fomoRateLimit.until > FOMO_BACKOFF_MAX_MS ? 0 : fomoRateLimit.level;
+        const level = Math.min(4, previousLevel + 1);
+        const fallback = Math.min(FOMO_BACKOFF_MAX_MS, FOMO_BACKOFF_BASE_MS * 2 ** (level - 1));
+        // A longer explicit server delay must never be shortened to our fallback cap.
+        fomoRateLimit = { until: now + Math.max(fallback, retryAfterMs(response, now)), level };
+        await chrome.storage.local.set({ [FOMO_RATE_LIMIT_KEY]: fomoRateLimit }).catch(() => {});
+        await response.body?.cancel().catch(() => {});
+        checkFomoRateLimit();
+      }
+      const text = await response.text();
+      let body = null;
+      try { body = JSON.parse(text); } catch { /* Cloudflare may return HTML. */ }
+      if (response.ok && !bodyIsUnauthorized(body) && body?.success !== false
+        && (!body?.statusCode || Number(body.statusCode) === 200) && fomoRateLimit.level) {
+        fomoRateLimit = { until: 0, level: 0 };
+        await chrome.storage.local.set({ [FOMO_RATE_LIMIT_KEY]: fomoRateLimit }).catch(() => {});
+      }
+      return { response, body, text };
+    } finally {
+      clearTimeout(timeout);
+      fomoNextRequestAt = Date.now() + FOMO_REQUEST_GAP_MS;
+    }
+  });
+  fomoRequestTail = task.catch(() => {});
+  return task;
+}
+
+function requestFailure(error, cached) {
+  if (error?.reason === 'rate-limited') {
+    const cooldown = { retryAt: error.retryAt, retryAfterMs: Math.max(0, error.retryAt - Date.now()) };
+    if (cached) return { ...cached.data, stale: true, reason: 'rate-limited', ...cooldown };
+    return { ok: false, reason: 'rate-limited', status: 429, ...cooldown };
+  }
+  return { ok: false, reason: 'network', message: String(error?.message || '').slice(0, 100) };
+}
+
+function shareRequest(pending, key, run) {
+  if (!pending.has(key)) {
+    const task = Promise.resolve().then(run).finally(() => pending.delete(key));
+    pending.set(key, task);
+  }
+  return pending.get(key);
 }
 
 async function authenticatedFetch(path) {
+  await loadFomoRateLimit();
+  checkFomoRateLimit();
   let stored = (await chrome.storage.local.get('fomoToken')).fomoToken || null;
-  if (stored?.refresh && Number(stored.exp) - Date.now() < 10_000) {
+  if (stored?.token && Number(stored.exp) - Date.now() < 10_000) {
     stored = (await refreshSession())
       || (await chrome.storage.local.get('fomoToken')).fomoToken
       || null;
   }
 
-  const send = (token) => {
-    const headers = { Accept: 'application/json', 'X-Supported-Chains': SUPPORTED_CHAINS };
-    if (token) headers.Authorization = `Bearer ${token}`;
-    return fetch(`${FOMO_API}${path}`, { headers, credentials: 'include' });
-  };
-
-  let response = await send(stored?.token);
-  let unauthorizedBody = false;
-  if (response.ok) {
-    unauthorizedBody = bodyIsUnauthorized(await response.clone().json().catch(() => null));
-  }
-  if ((response.status === 401 || unauthorizedBody) && stored?.refresh) {
+  let result = await queuedFomoFetch(path, stored?.token);
+  const isUnauthorized = ({ response, body }) => response.status === 401 || bodyIsUnauthorized(body);
+  if (isUnauthorized(result) && stored?.token) {
     const renewed = await refreshSession();
     if (renewed?.token && renewed.token !== stored.token) {
       stored = renewed;
-      response = await send(renewed.token);
+      result = await queuedFomoFetch(path, renewed.token);
     }
   }
-  return { response, stored };
+  return { ...result, stored, unauthorized: isUnauthorized(result) };
 }
 
 function requestPath({ tokenAddress, networkId, kind }) {
@@ -382,7 +707,12 @@ function requestPath({ tokenAddress, networkId, kind }) {
   return `/feed/token?tokenAddress=${token}&networkId=${network}&excludeThesis=true&limit=50`;
 }
 
-async function fetchTokenData(payload) {
+function fetchTokenData(payload) {
+  const key = `${payload?.kind}|${payload?.networkId}|${payload?.tokenAddress}`;
+  return shareRequest(tokenRequests, key, () => fetchTokenDataOnce(payload));
+}
+
+async function fetchTokenDataOnce(payload) {
   const tokenAddress = String(payload?.tokenAddress || '').trim();
   const networkId = Number(payload?.networkId);
   const kind = ['holders', 'thesis', 'swaps'].includes(payload?.kind) ? payload.kind : 'thesis';
@@ -393,24 +723,25 @@ async function fetchTokenData(payload) {
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.data;
 
   try {
-    const { response, stored } = await authenticatedFetch(requestPath({ tokenAddress, networkId, kind }));
+    const { response, stored, body, text, unauthorized } = await authenticatedFetch(requestPath({ tokenAddress, networkId, kind }));
+    if (unauthorized) {
+      return { ok: false, reason: stored?.token ? 'expired' : 'no-token', status: response.status };
+    }
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
       const blocked = /cloudflare|cf-ray|<!doctype html/i.test(text);
       return {
         ok: false,
-        reason: blocked ? 'blocked' : response.status === 401 ? (stored?.token ? 'expired' : 'no-token') : `http-${response.status}`,
+        reason: blocked ? 'blocked' : `http-${response.status}`,
         status: response.status,
       };
     }
 
-    const body = await response.json().catch(() => null);
+    if (!body || typeof body !== 'object') return { ok: false, reason: 'invalid-response' };
     const status = Number(body?.statusCode);
     if (body?.success === false || (Number.isFinite(status) && status !== 200)) {
-      const unauthorized = status === 401 || status === 403;
       return {
         ok: false,
-        reason: unauthorized ? (stored?.token ? 'expired' : 'no-token') : `api-${status || 'error'}`,
+        reason: `api-${status || 'error'}`,
         status: status || response.status,
         message: String(body?.message || '').slice(0, 120),
       };
@@ -432,11 +763,15 @@ async function fetchTokenData(payload) {
     putBounded(responseCache, key, { at: Date.now(), data });
     return data;
   } catch (error) {
-    return { ok: false, reason: 'network', message: String(error?.message || '').slice(0, 100) };
+    return requestFailure(error, cached);
   }
 }
 
-async function fetchUserPnl(userId) {
+function fetchUserPnl(userId) {
+  return shareRequest(pnlRequests, String(userId || '').trim(), () => fetchUserPnlOnce(userId));
+}
+
+async function fetchUserPnlOnce(userId) {
   const id = String(userId || '').trim();
   if (!id) return { ok: false, reason: 'no-user' };
   const cached = pnlCache.get(id);
@@ -445,12 +780,13 @@ async function fetchUserPnl(userId) {
   const since = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
   const path = `/v2/userTokens/aggregatedSnapshot?userId=${encodeURIComponent(id)}&timestamp=${encodeURIComponent(since)}`;
   try {
-    const { response } = await authenticatedFetch(path);
-    if (!response.ok) return { ok: false, reason: response.status === 401 ? 'expired' : `http-${response.status}` };
-    const body = await response.json().catch(() => null);
+    const { response, stored, body, unauthorized } = await authenticatedFetch(path);
+    if (unauthorized) return { ok: false, reason: stored?.token ? 'expired' : 'no-token' };
+    if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+    if (!body || typeof body !== 'object') return { ok: false, reason: 'invalid-response' };
     const status = Number(body?.statusCode);
     if (body?.success === false || (Number.isFinite(status) && status !== 200)) {
-      return { ok: false, reason: status === 401 ? 'expired' : `api-${status || 'error'}` };
+      return { ok: false, reason: `api-${status || 'error'}` };
     }
     const rows = (Array.isArray(body?.responseObject) ? body.responseObject : [])
       .filter((row) => Number.isFinite(Number(row?.pnl)))
@@ -463,37 +799,43 @@ async function fetchUserPnl(userId) {
     putBounded(pnlCache, id, { at: Date.now(), data }, 400);
     return data;
   } catch (error) {
-    return { ok: false, reason: 'network', message: String(error?.message || '').slice(0, 100) };
+    return requestFailure(error, cached);
   }
 }
 
 async function recordHeartbeat(message, sender) {
   const tabId = Number(sender?.tab?.id);
-  let url;
-  try {
-    url = new URL(String(sender?.tab?.url || ''));
-  } catch {
-    return;
-  }
-  if (!Number.isInteger(tabId) || !(url.hostname === 'fomo.family' || url.hostname.endsWith('.fomo.family'))) return;
-  const keeper = message?.keeper === true || url.searchParams.has('fomo_dock_keeper');
+  const url = fomoTabUrl(sender?.tab || {});
+  if (!Number.isInteger(tabId) || !url || (sender.frameId && sender.frameId !== 0)) return;
+  const state = (await chrome.storage.session.get(KEEPER_STATE_KEY))[KEEPER_STATE_KEY];
+  const keeper = Boolean(sender.tab.pinned && (state?.owned?.includes(tabId) || url.searchParams.get('fomo_dock_keeper') === '1'));
   await chrome.storage.local.set({
     fomoPage: { at: Date.now(), visible: message?.visible === true, tabId, keeper },
   });
-  if (keeper) {
-    await ensureSessionOwner(false);
-  } else {
-    const extras = (await fomoTabs())
-      .filter((tab) => tab.id !== tabId && isKeeperTab(tab))
-      .map((tab) => tab.id)
-      .filter(Number.isInteger);
-    if (extras.length) await chrome.tabs.remove(extras).catch(() => {});
+  // Heartbeats are diagnostic only. They never open, reload, or close a page.
+}
+
+function mirrorFomoSession(message, sender) {
+  if (sender?.id !== chrome.runtime.id || !fomoTabUrl(sender?.tab || {}) || (sender.frameId && sender.frameId !== 0)) {
+    return Promise.resolve({ ok: false });
   }
+  const token = String(message?.token || '');
+  const exp = jwtExpiry(token);
+  if (!token || token.length > 16_384 || !Number.isFinite(exp) || exp <= 0) return Promise.resolve({ ok: false });
+  const task = sessionMirrorQueue.then(async () => {
+    const { fomoToken } = await chrome.storage.local.get('fomoToken');
+    if (fomoToken?.token !== token && Number(fomoToken?.exp) >= exp) return { ok: true };
+    if (fomoToken?.token === token && !fomoToken.refresh) return { ok: true };
+    await chrome.storage.local.set({ fomoToken: { token, exp, at: Date.now() } });
+    return { ok: true };
+  });
+  sessionMirrorQueue = task.catch(() => {});
+  return task;
 }
 
 chrome.runtime.onInstalled.addListener((details) => {
   chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 5 });
-  dedupeKeeperTabs().catch(() => {});
+  scheduleSessionExpiry().catch(() => {});
   const previous = String(details?.previousVersion || '0.0.0').split('.').map(Number);
   if (details?.reason === 'install' || previous[0] < 1 && previous[1] < 3) {
     chrome.storage.local.set({ fdFeedEnabled: false }).catch(() => {});
@@ -506,10 +848,19 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === KEEPALIVE_ALARM) keepSessionAlive(false).catch(() => {});
+  if (alarm.name === KEEPALIVE_ALARM || alarm.name === EXPIRY_ALARM) keepSessionAlive(true).catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === '985-monitor-sync-acquire' || message?.type === '985-monitor-sync-finish') {
+    const task = message.type.endsWith('acquire') ? acquireMonitorSync(message, sender) : finishMonitorSync(message, sender);
+    task.then(sendResponse).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+  if (message?.type === 'fomo-session-observed') {
+    mirrorFomoSession(message, sender).then(sendResponse).catch(() => sendResponse({ ok: false }));
+    return true;
+  }
   if (message?.type === '985-monitor-session-updated') {
     resetFomoFeedCache();
     refreshMonitor985Config(true)
@@ -528,7 +879,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'fomo-force-refresh') {
-    keepSessionAlive(true)
+    refreshSession()
       .then(() => chrome.storage.local.get('fomoToken'))
       .then(({ fomoToken }) => sendResponse({
         ok: Boolean(fomoToken?.token && Number(fomoToken.exp) > Date.now()),
@@ -555,10 +906,16 @@ chrome.alarms.get(KEEPALIVE_ALARM).then((alarm) => {
   if (!alarm) chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 5 });
 }).catch(() => {});
 
-// A service worker can start after Chrome has restored several stale pinned
-// keepers. Remove duplicates immediately without creating a new page.
-dedupeKeeperTabs().catch(() => {});
+scheduleSessionExpiry().catch(() => {});
+
+chrome.tabs.onRemoved.addListener((tabId) => { releaseKeeper(tabId, true).catch(() => {}); });
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (change.pinned === false || (change.url && !fomoTabUrl(tab))) {
+    releaseKeeper(tabId, false, change.pinned === false && Boolean(fomoTabUrl(tab))).catch(() => {});
+  }
+});
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.monitor985SessionV1) resetFomoFeedCache();
+  if (area === 'local' && (changes.fomoToken || changes.fdEnabled)) scheduleSessionExpiry().catch(() => {});
 });

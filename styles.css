@@ -353,6 +353,19 @@
   white-space: nowrap;
 }
 
+.fd-request-status {
+  flex: none;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--fd-border);
+  color: var(--fd-text-muted);
+  font-size: 11px;
+}
+
+.fd-request-status[hidden],
+.fd-panel.is-folded .fd-request-status {
+  display: none;
+}
+
 .fd-list {
   min-height: 120px;
   overflow-x: hidden;

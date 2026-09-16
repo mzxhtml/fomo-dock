@@ -12,7 +12,7 @@
   const DEFAULTS = {
     fdEnabled: true,
     fdFolded: false,
-    fdRefreshSeconds: 30,
+    fdRefreshSeconds: 120,
     fdShowPnl: true,
     fdTranslate: false,
     fdDisplayMode: 'tab',
@@ -28,6 +28,7 @@
     bnb: 56,
     monad: 143,
     robinhood: 4663,
+    arc: 5042,
     base: 8453,
     sol: 1399811149,
     solana: 1399811149,
@@ -37,6 +38,8 @@
     ethereum: 'eth',
     bnb: 'bsc',
     solana: 'sol',
+    chain5042: 'arc',
+    'chain 5042': 'arc',
   };
 
   const FOMO_CHAIN = {
@@ -46,6 +49,7 @@
     sol: 'sol',
     robinhood: 'robinhood',
     monad: 'monad',
+    arc: 'arc',
   };
 
   let settings = { ...DEFAULTS };
@@ -64,6 +68,7 @@
   let refreshResumeTimer = 0;
   let refreshPaused = false;
   let refreshPending = false;
+  let apiRetryAt = 0;
   let routeTimer = 0;
   let currentRouteKey = '';
   let pnlObserver = null;
@@ -410,7 +415,8 @@
     if (!response?.ok || !Number.isFinite(pnl)) {
       element.classList.add('is-none');
       element.textContent = '—';
-      element.title = response?.reason === 'expired' ? 'FOMO 登录态已过期' : '暂无 7 日盈亏数据';
+      element.title = response?.reason === 'rate-limited' ? rateLimitNote(response)
+        : ['expired', 'no-token'].includes(response?.reason) ? '请登录 FOMO 后重试' : '暂无 7 日盈亏数据';
       return;
     }
     const equity = Number(response.equity) || 0;
@@ -425,7 +431,7 @@
   }
 
   function pumpPnlQueue() {
-    while (pnlActive < 3 && pnlQueue.length) {
+    while (pnlActive < 1 && pnlQueue.length) {
       const job = pnlQueue.shift();
       if (!job.element.isConnected) continue;
       const cached = pnlCache.get(job.userId);
@@ -436,9 +442,12 @@
       pnlActive += 1;
       runtimeMessage({ type: 'fomo-user-pnl', payload: { userId: job.userId } })
         .then((response) => {
-          pnlCache.set(job.userId, { at: Date.now(), data: response });
+          if (response?.ok && !response.stale) pnlCache.set(job.userId, { at: Date.now(), data: response });
           while (pnlCache.size > 300) pnlCache.delete(pnlCache.keys().next().value);
-          if (job.element.isConnected) paintPnl(job.element, response);
+          if (job.element.isConnected) {
+            paintPnl(job.element, response);
+            if (response?.reason === 'rate-limited') syncRequestStatus(response);
+          }
         })
         .finally(() => {
           pnlActive -= 1;
@@ -698,23 +707,42 @@
     }
   }
 
+  function rateLimitNote(response) {
+    const until = Number(response?.retryAt) || apiRetryAt;
+    const time = new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `FOMO 请求暂时受限，${time} 后自动重试。`;
+  }
+
+  function syncRequestStatus(response) {
+    if (response?.reason === 'rate-limited') apiRetryAt = Number(response.retryAt) || 0;
+    const status = panel?.querySelector('.fd-request-status');
+    if (!status) return;
+    const waiting = apiRetryAt > Date.now();
+    status.hidden = !waiting;
+    status.textContent = waiting ? `${rateLimitNote()} 已加载的内容可继续查看。` : '';
+  }
+
   function showError(list, response) {
+    delete list.dataset.fdFetchedAt;
+    delete list.dataset.fdDataKey;
     list.replaceChildren();
     const guide = document.createElement('div');
     guide.className = 'fd-guide';
     const reason = response?.reason || 'unknown';
     const needsLogin = reason === 'no-token' || reason === 'expired';
     const title = document.createElement('strong');
-    title.textContent = needsLogin ? '需要同步 FOMO 登录态' : `加载失败（${cleanText(reason, 40)}）`;
+    title.textContent = needsLogin ? '需要同步 FOMO 登录态'
+      : reason === 'rate-limited' ? 'FOMO 请求暂时受限' : `加载失败（${cleanText(reason, 40)}）`;
     const note = document.createElement('p');
-    if (reason === 'blocked') note.textContent = 'FOMO 风控暂时拒绝了请求，请稍后重试。';
+    if (reason === 'rate-limited') note.textContent = rateLimitNote(response);
+    else if (reason === 'blocked') note.textContent = 'FOMO 风控暂时拒绝了请求，请稍后重试。';
     else if (reason === 'network') note.textContent = `网络请求失败：${cleanText(response?.message || '请检查网络', 100)}`;
     else if (needsLogin) note.textContent = '打开 FOMO，确认已经登录并刷新一次。本插件会自动读取登录态，无需复制令牌。';
     else note.textContent = cleanText(response?.message || '请稍后重试', 120);
     guide.append(title, note);
     if (needsLogin) {
       const link = document.createElement('a');
-      link.href = 'https://fomo.family/';
+      link.href = 'https://fomo.family/token';
       link.target = '_blank';
       link.rel = 'noreferrer';
       link.textContent = '打开 FOMO 并登录 →';
@@ -728,7 +756,7 @@
       loadedKey = '';
       loadData(true);
     });
-    guide.appendChild(retry);
+    if (reason !== 'rate-limited') guide.appendChild(retry);
     list.appendChild(guide);
   }
 
@@ -736,7 +764,8 @@
     const route = tokenRoute();
     if (!route || !panel || loading) return;
     const backgroundRefresh = source === 'auto' || source === 'resume';
-    if (source === 'auto' && refreshPaused) {
+    if (backgroundRefresh && Date.now() < apiRetryAt) return;
+    if (backgroundRefresh && refreshPaused) {
       refreshPending = true;
       syncRefreshPauseIndicator();
       return;
@@ -746,6 +775,8 @@
     loading = true;
     const list = panel.querySelector('.fd-list');
     if (!backgroundRefresh || !list.children.length) {
+      delete list.dataset.fdFetchedAt;
+      delete list.dataset.fdDataKey;
       list.replaceChildren();
       renderEmpty(list, '加载中…');
     }
@@ -754,18 +785,30 @@
       payload: { tokenAddress: route.address, networkId: route.networkId, kind: activeTab },
     });
     loading = false;
-    if (!panel || routeKey() !== routeKey(route)
+    if (!panel || !panel.contains(list) || routeKey() !== routeKey(route)
       || `${activeTab}|${routeKey(route)}` !== key) return;
-    if (source === 'auto' && refreshPaused) {
+    if (backgroundRefresh && refreshPaused) {
       refreshPending = true;
       syncRefreshPauseIndicator();
       return;
     }
-    if (!response?.ok) return showError(list, response);
+    syncRequestStatus(response);
+    if (!response?.ok) {
+      if (response?.reason === 'rate-limited') {
+        loadedKey = key;
+        if (list.dataset.fdDataKey === key) return;
+      }
+      return showError(list, response);
+    }
     loadedKey = key;
+    // Cache hits and cooldown fallback reuse the same snapshot. Leave the DOM,
+    // translations and scroll position intact when there is nothing new.
+    if (list.dataset.fdDataKey === key && list.dataset.fdFetchedAt === String(response.fetchedAt)) return;
     items = Array.isArray(response.items) ? response.items : [];
     renderStats(response);
     renderItems(list, items, activeTab);
+    list.dataset.fdDataKey = key;
+    list.dataset.fdFetchedAt = String(response.fetchedAt);
     translateWhenReady();
   }
 
@@ -961,11 +1004,15 @@
 
     const stats = document.createElement('div');
     stats.className = 'fd-stats';
+    const requestStatus = document.createElement('div');
+    requestStatus.className = 'fd-request-status';
+    requestStatus.setAttribute('role', 'status');
+    requestStatus.hidden = true;
     const list = document.createElement('div');
     list.className = 'fd-list';
     list.addEventListener('mouseenter', () => setRefreshPaused(true, root));
     list.addEventListener('mouseleave', () => setRefreshPaused(false, root));
-    root.append(bar, stats, list);
+    root.append(bar, stats, requestStatus, list);
     syncRefreshPauseIndicator(root);
     if (!embedded) {
       makeDraggable(bar);
@@ -1296,7 +1343,7 @@
 
   function syncRefreshTimer() {
     if (refreshTimer) window.clearInterval(refreshTimer);
-    const seconds = Math.max(15, Math.min(300, Number(settings.fdRefreshSeconds) || 30));
+    const seconds = Math.max(120, Math.min(300, Number(settings.fdRefreshSeconds) || 120));
     refreshTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
         loadData(true, 'auto');

@@ -3,7 +3,7 @@
 const DEFAULTS = {
   fdEnabled: true,
   fdShowPnl: true,
-  fdRefreshSeconds: 30,
+  fdRefreshSeconds: 120,
   fdFeedEnabled: false,
   fdThesisFontSize: 12,
 };
@@ -61,7 +61,7 @@ async function init() {
   elements.showPnl.checked = stored.fdShowPnl;
   elements.feedEnabled.checked = stored.fdFeedEnabled;
   elements.thesisFontSize.value = String(stored.fdThesisFontSize);
-  elements.refresh.value = String(stored.fdRefreshSeconds);
+  elements.refresh.value = String(Number(stored.fdRefreshSeconds) >= 300 ? 300 : 120);
   elements.version.textContent = `v${chrome.runtime.getManifest().version}`;
   renderSession(stored.fomoToken);
   renderMonitor(stored.monitor985SyncStateV1);
@@ -88,7 +88,7 @@ elements.refresh.addEventListener('change', () => {
 });
 
 elements.openFomo.addEventListener('click', () => {
-  chrome.tabs.create({ url: 'https://fomo.family/' });
+  chrome.tabs.create({ url: 'https://fomo.family/token' });
 });
 
 elements.openMonitor.addEventListener('click', () => {

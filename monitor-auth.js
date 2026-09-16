@@ -1,122 +1,108 @@
 (() => {
   'use strict';
-  if (!/(^|\.)985monitor\.xyz$/.test(location.hostname) || window.__fomoDockMonitorAuth) return;
-  window.__fomoDockMonitorAuth = true;
-
-  const readJson = (key, fallback) => {
-    try {
-      const parsed = JSON.parse(window.localStorage.getItem(key) || fallback);
-      return parsed == null ? JSON.parse(fallback) : parsed;
-    } catch { return JSON.parse(fallback); }
-  };
-  const accountKey = (value) => (/^0x/i.test(String(value || ''))
-    ? String(value || '').toLowerCase() : String(value || ''));
-  const pageAuth = () => ({
-    wallet: String(window.localStorage.getItem('xMonitorWalletAddress') || '').trim(),
-    token: String(window.localStorage.getItem('xMonitorWalletToken') || '').trim(),
-  });
-  const pagePrefs = () => {
-    let muted = readJson('xMonitorFomoMutedV1', '[]');
-    let prefs = readJson('xMonitorFomoPrefsV1', '{}');
-    if (!Array.isArray(muted)) muted = [];
-    if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = {};
-    return { fomo: { muted, prefs } };
-  };
-  const pageHeaders = ({ wallet, token }) => ({
-    'Content-Type': 'application/json', 'X-User-Id': wallet,
-    'X-User-Token': token, 'X-Wallet-Address': wallet,
-  });
+  if (!/(^|\.)985monitor\.xyz$/.test(location.hostname)) return;
+  try { window.__fomoDockMonitorCleanup?.(); } catch { /* Old extension context. */ }
+  let stopped = false;
   let inflight = null;
-  let lastPrefsStamp = '';
-  let lastFullSyncAt = 0;
+  let timer;
+  let controller;
 
-  async function applyConfig(config, session) {
-    if (!config?.connected || !config?.account?.userId) return;
-    const at = Date.now();
-    await chrome.storage.local.set({
-      monitorFomoConfig: {
-        ...(config.fomo || {}), wallet: config.account.userId,
-        connected: true, revision: config.revision, at,
-      },
-      monitor985SyncStateV1: {
-        connected: true, accountId: config.account.userId,
-        displayName: String(config.account.displayName || ''), syncedAt: at,
-        expiresAt: Number(session?.expiresAt || config.sessionExpiresAt) || 0,
-      },
-    });
+  function cleanup() {
+    stopped = true;
+    controller?.abort();
+    window.clearInterval(timer);
+    window.removeEventListener('focus', onChange);
+    window.removeEventListener('storage', onChange);
+    document.removeEventListener('visibilitychange', onChange);
+    try { chrome.runtime.onMessage.removeListener(onMessage); } catch {}
   }
-
-  async function sync(force = false) {
-    if (inflight) return inflight;
+  function alive() {
+    try { if (!stopped && chrome.runtime.id) return true; } catch {}
+    cleanup();
+    return false;
+  }
+  async function message(value) {
+    if (!alive()) return null;
+    try { return await chrome.runtime.sendMessage(value); }
+    catch (error) {
+      if (/context invalidated/i.test(String(error?.message || ''))) cleanup();
+      return null;
+    }
+  }
+  function readJson(key, fallback) {
+    try { return JSON.parse(window.localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+  }
+  function pageAuth() {
+    try {
+      return { wallet: String(window.localStorage.getItem('xMonitorWalletAddress') || '').trim(),
+        token: String(window.localStorage.getItem('xMonitorWalletToken') || '').trim() };
+    } catch { return { wallet: '', token: '' }; }
+  }
+  function pagePrefs() {
+    const muted = readJson('xMonitorFomoMutedV1', []);
+    const prefs = readJson('xMonitorFomoPrefsV1', {});
+    return { fomo: { muted: Array.isArray(muted) ? muted : [],
+      prefs: prefs && typeof prefs === 'object' && !Array.isArray(prefs) ? prefs : {} } };
+  }
+  function retryDelay(response) {
+    if (response.status !== 429) return 30_000;
+    const raw = response.headers.get('Retry-After') || '';
+    const delay = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+    return Math.max(60_000, Number.isFinite(delay) ? delay : 0);
+  }
+  function sync() {
+    if (!alive() || inflight) return inflight;
     inflight = (async () => {
       const auth = pageAuth();
-      const stored = await chrome.storage.local.get({
-        monitor985SessionV1: null, monitor985ClientIdV1: '', monitor985SyncStateV1: null,
-      });
-      let clientId = String(stored.monitor985ClientIdV1 || '').trim();
-      if (!clientId) {
-        clientId = typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID() : `chrome-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        await chrome.storage.local.set({ monitor985ClientIdV1: clientId });
-      }
-      const session = stored.monitor985SessionV1;
-      const sameAccount = accountKey(session?.accountId) === accountKey(auth.wallet);
-      const sessionFresh = sameAccount && session?.token
-        && Number(session.expiresAt) > Date.now() + 24 * 60 * 60_000;
-      if (!auth.wallet || !auth.token) {
-        if (!sessionFresh) {
-          await chrome.storage.local.set({
-            monitor985SyncStateV1: { connected: false, reason: 'login-required', checkedAt: Date.now() },
-          });
-        }
-        return;
-      }
+      // A signed-out/background tab must not erase another tab's valid session.
+      if (!auth.wallet || !auth.token) return;
       const prefs = pagePrefs();
-      const prefsStamp = JSON.stringify(prefs);
-      const needsRebind = !sessionFresh || stored.monitor985SyncStateV1?.reason === 'unauthorized';
-      const periodic = Date.now() - lastFullSyncAt >= 3 * 60_000;
-      if (!force && !needsRebind && prefsStamp === lastPrefsStamp && !periodic) return;
-      const endpoint = needsRebind ? '/api/extension/session' : '/api/extension/prefs';
-      const response = await fetch(endpoint, {
-        method: 'POST', headers: pageHeaders(auth), cache: 'no-store',
-        body: JSON.stringify(needsRebind ? { clientId, prefs } : { prefs }),
-      });
-      const body = await response.json().catch(() => null);
-      if (!response.ok || body?.ok !== true || !body?.config) {
-        if (response.status === 401) {
-          await chrome.storage.local.set({
-            monitor985SyncStateV1: { connected: false, reason: 'login-required', checkedAt: Date.now() },
-          });
+      const permit = await message({ type: '985-monitor-sync-acquire',
+        account: auth.wallet, visible: document.visibilityState === 'visible', prefsStamp: JSON.stringify(prefs) });
+      if (!permit?.ok || !permit.lease) return;
+      let outcome = { status: 0, retryAfterMs: 30_000 };
+      let timeout;
+      try {
+        if (!alive()) return;
+        const current = pageAuth();
+        if (current.wallet !== auth.wallet || current.token !== auth.token) {
+          outcome = { cancelled: true };
+          return;
         }
-        return;
+        controller = new AbortController();
+        timeout = window.setTimeout(() => controller.abort(), 20_000);
+        const response = await fetch(permit.needsRebind ? '/api/extension/session' : '/api/extension/prefs', {
+          method: 'POST', cache: 'no-store', signal: controller.signal,
+          headers: { 'Content-Type': 'application/json', 'X-User-Id': auth.wallet,
+            'X-User-Token': auth.token, 'X-Wallet-Address': auth.wallet },
+          body: JSON.stringify(permit.needsRebind ? { clientId: permit.clientId, prefs } : { prefs }),
+        });
+        const body = await response.json().catch(() => null);
+        const after = pageAuth();
+        outcome = after.wallet === auth.wallet && after.token === auth.token
+          ? { status: response.status, body, retryAfterMs: retryDelay(response) } : { cancelled: true };
+      } catch { /* Shared cooldown is released in finally. */ }
+      finally {
+        window.clearTimeout(timeout);
+        controller = null;
+        await message({ type: '985-monitor-sync-finish', lease: permit.lease, ...outcome });
       }
-      let activeSession = session;
-      if (body.session?.token) {
-        activeSession = {
-          token: body.session.token, clientId: body.session.clientId || clientId,
-          expiresAt: Number(body.session.expiresAt) || 0, accountId: body.config.account.userId,
-        };
-        await chrome.storage.local.set({ monitor985SessionV1: activeSession });
-      }
-      await applyConfig(body.config, activeSession);
-      lastPrefsStamp = prefsStamp;
-      lastFullSyncAt = Date.now();
-      chrome.runtime.sendMessage({ type: '985-monitor-session-updated' }, () => void chrome.runtime.lastError);
     })().catch(() => {}).finally(() => { inflight = null; });
     return inflight;
   }
-
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== '985-monitor-sync-now') return false;
-    sync(false);
-    sendResponse({ ok: true });
+  function onChange() { if (document.visibilityState === 'visible') void sync(); }
+  function onMessage(value, sender, reply) {
+    if (value?.type !== '985-monitor-sync-now' || sender.id !== chrome.runtime.id) return false;
+    sync();
+    reply({ ok: true });
     return false;
-  });
-  sync(true);
-  window.setInterval(() => sync(false), 15_000);
-  window.addEventListener('focus', () => sync(true));
-  window.addEventListener('storage', () => sync(false));
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') sync(false);
-  });
+  }
+  window.__fomoDockMonitorCleanup = cleanup;
+  if (!alive()) return;
+  try { chrome.runtime.onMessage.addListener(onMessage); } catch { cleanup(); return; }
+  timer = window.setInterval(sync, 15_000);
+  window.addEventListener('focus', onChange);
+  window.addEventListener('storage', onChange);
+  document.addEventListener('visibilitychange', onChange);
+  sync();
 })();

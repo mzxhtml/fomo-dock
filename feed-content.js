@@ -36,6 +36,8 @@
   let renderRaf = 0;
   let observer = null;
   let loginPromptDismissed = false;
+  let columnObserver = null;
+  let columnNodes = [];
 
   const safeText = (value, max = 128) => String(value ?? '')
     .replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
@@ -140,20 +142,19 @@
 
   function eventIdentity(event) {
     const tx = normalize(event?.tx);
-    if (tx) return `tx:${tx}`;
-    return `${normalize(event?.addr)}:${event?.type}:${normalize(event?.handle)}`
-      + `:${Math.round(Number(event?.ts) / 1000)}:${Math.round(Number(event?.usd) * 100)}`;
+    if (tx) return `tx:${event.chain || ''}:${tx}:${normalize(event.addr)}:${event.type}:${normalize(event.handle)}`;
+    // Preserve distinct server events when there is no hash to compare.
+    return `key:${event?.source || 'fomo'}:${event?.key || ''}`;
   }
 
   function isNativeDuplicate(event, row) {
     if (event.type !== 'buy' && event.type !== 'sell') return false;
     const tx = normalize(event.tx);
-    if (tx && row.tx && tx === normalize(row.tx)) return true;
-    if (!event.addr || normalize(event.addr) !== normalize(row.addr) || event.type !== row.side) return false;
     if (event.chain && row.chain && event.chain !== row.chain) return false;
-    if (!event.ts || !row.ts || Math.abs(Number(event.ts) - Number(row.ts)) > 15_000) return false;
-    const usd = Number(event.usd) || 0;
-    return Boolean(usd && row.usd && Math.abs(usd - row.usd) <= Math.max(1, Math.max(usd, row.usd) * 0.05));
+    if (event.type !== row.side || normalize(event.addr) !== normalize(row.addr)) return false;
+    // FOMO supplies a social handle, not a comparable native wallet identity.
+    // Neither similar amounts/timestamps nor unequal hashes prove duplication.
+    return Boolean(tx && row.tx && tx === normalize(row.tx));
   }
 
   function visibleEvents(nativeRows = []) {
@@ -363,6 +364,70 @@
     return card;
   }
 
+  function measureGmgnColumns(bounds, boxes) {
+    if (boxes.length !== 5 || !(bounds.width > 0)
+      || boxes.some((box) => !(box.width > 0 && box.height > 0))) return null;
+    const left = boxes[0].left - bounds.left;
+    const right = bounds.right - boxes[4].right;
+    const inner = boxes[4].right - boxes[0].left;
+    if (left < -0.5 || right < -0.5 || inner <= 0) return null;
+    const tracks = [];
+    for (let i = 0; i < boxes.length; i++) {
+      if (i) {
+        const gap = boxes[i].left - boxes[i - 1].right;
+        if (gap < -0.5) return null;
+        tracks.push(Math.max(0, gap));
+      }
+      tracks.push(boxes[i].width);
+    }
+    const percent = (value, total) => `${(Math.max(0, value) / total * 100).toFixed(6)}%`;
+    return { columns: tracks.map((width) => percent(width, inner)).join(' '),
+      left: percent(left, bounds.width), right: percent(right, bounds.width) };
+  }
+
+  function gmgnTableLayout(row) {
+    const inner = row.querySelector('[data-testid="follow-tracking-row-symbol"]')?.parentElement || row;
+    const outer = row.closest('[data-sentry-component="TableItem"][href*="/token/"]') || row;
+    const candidates = [{ inner, outer }];
+    if (outer !== row || outer.matches('[data-sentry-component="TableItem"]')) {
+      const header = document.querySelector('[data-testid="follow-tracking-table-header"]');
+      if (header) candidates.push({ inner: header, outer: header });
+    }
+    for (const candidate of candidates) {
+      const cells = [...candidate.inner.children].filter((node) => node instanceof HTMLElement
+        && !node.matches('[data-fd-feed-owned="1"]'));
+      const layout = measureGmgnColumns(candidate.outer.getBoundingClientRect(), cells.map((node) => node.getBoundingClientRect()));
+      if (layout) return { ...layout, nodes: [candidate.outer, ...cells] };
+    }
+    return null;
+  }
+
+  function observeGmgnColumns(rows) {
+    const next = [...new Set(rows.slice(0, 3).flatMap((row) => gmgnTableLayout(row)?.nodes || []))];
+    if (next.length === columnNodes.length && next.every((node, index) => node === columnNodes[index])) return;
+    columnObserver?.disconnect();
+    columnNodes = next;
+    if (!next.length || typeof ResizeObserver === 'undefined') return;
+    columnObserver ||= new ResizeObserver(scheduleRender);
+    next.forEach((node) => columnObserver.observe(node));
+  }
+
+  function buildGmgnFeedCard(event, nativeRow) {
+    const layout = gmgnTableLayout(nativeRow);
+    if (!layout) return buildGmgnCard(event);
+    const card = buildDebotCard(event, 'gmgn');
+    const cell = (name) => card.querySelector(`.fd-feed-table__${name}`);
+    const cells = ['time', 'who', 'token', 'amount', 'mc'].map(cell);
+    cells[2].appendChild(cell('action'));
+    const comment = cell('comment');
+    cells.forEach((node, index) => { node.style.gridColumn = String(index * 2 + 1); card.appendChild(node); });
+    if (comment) card.appendChild(comment);
+    card.style.gridTemplateColumns = layout.columns;
+    card.style.paddingLeft = layout.left;
+    card.style.paddingRight = layout.right;
+    return card;
+  }
+
   function nativeTransformY(raw) {
     const text = safeText(raw, 200);
     let match = text.match(/translateY\(\s*(-?[\d.]+)px\s*\)/i);
@@ -453,8 +518,12 @@
 
   function layoutGmgn() {
     const rows = gmgnRows();
+    observeGmgnColumns(rows);
     if (!rows.length) return;
-    const infos = rows.map((row) => ({ row, fixed: fixedRow(row), ts: Number(row.dataset.fdFeedTrackTs) || 0 }))
+    const infos = rows.map((row) => ({
+      row: row.closest('[data-sentry-component="TableItem"][href*="/token/"]') || row,
+      fixed: fixedRow(row), ts: Number(row.dataset.fdFeedTrackTs) || 0,
+    }))
       .filter((item) => item.ts > 0);
     if (!infos.length) return;
     infos.sort((a, b) => {
@@ -490,14 +559,14 @@
       const head = groups.get('before:0') || [];
       let previous = null;
       head.forEach((event) => {
-        const card = buildGmgnCard(event);
+        const card = buildGmgnFeedCard(event, infos[0].row);
         if (previous) previous.after(card); else infos[0].row.before(card);
         previous = card;
       });
       infos.forEach((item, index) => {
         let anchor = item.row;
         (groups.get(`after:${index}`) || []).forEach((event) => {
-          const card = buildGmgnCard(event); anchor.after(card); anchor = card;
+          const card = buildGmgnFeedCard(event, item.row); anchor.after(card); anchor = card;
         });
       });
       return;
@@ -506,7 +575,7 @@
     let inserted = 0;
     infos.forEach((item, index) => {
       for (const event of groups.get(`before:${index}`) || []) {
-        const card = buildGmgnCard(event);
+        const card = buildGmgnFeedCard(event, item.row);
         card.classList.add('is-absolute');
         card.style.top = `${item.fixed.top + inserted}px`; spacer.appendChild(card);
         inserted += card.offsetHeight + 2;
@@ -515,7 +584,7 @@
       wrapper.dataset.fdFeedTranslate = wrapper.style.translate || '';
       wrapper.dataset.fdFeedShift = '1'; wrapper.style.translate = `0 ${inserted}px`;
       for (const event of groups.get(`after:${index}`) || []) {
-        const card = buildGmgnCard(event);
+        const card = buildGmgnFeedCard(event, item.row);
         card.classList.add('is-absolute');
         card.style.top = `${item.fixed.top + item.fixed.height + inserted}px`; spacer.appendChild(card);
         inserted += card.offsetHeight + 2;
@@ -674,7 +743,10 @@
   function render() {
     renderRaf = 0;
     teardown();
-    if (!settings.fdFeedEnabled || document.visibilityState === 'hidden') return;
+    if (!settings.fdFeedEnabled || document.visibilityState === 'hidden') {
+      columnObserver?.disconnect(); columnNodes = [];
+      return;
+    }
     if (location.hostname === 'gmgn.ai') layoutGmgn();
     else if (location.hostname === 'debot.ai') {
       layoutDebotTable();
@@ -701,7 +773,7 @@
     try {
       const response = await runtimeMessage({ type: 'fomo-feed' });
       if (response?.ok) events = Array.isArray(response.events) ? response.events : [];
-      else if (response?.reason === 'not-connected') events = [];
+      else if (['not-connected', 'session-changed'].includes(response?.reason)) events = [];
       scheduleRender();
     } finally { pollInflight = false; }
   }
@@ -725,6 +797,7 @@
       if (changes.fdFeedChainOnly) settings.fdFeedChainOnly = changes.fdFeedChainOnly.newValue === true;
       if (changes.fdFeedTypes) settings.fdFeedTypes = changes.fdFeedTypes.newValue || DEFAULTS.fdFeedTypes;
       if (changes.monitorFomoConfig) loadMonitor(changes.monitorFomoConfig.newValue);
+      if (changes.monitor985SessionV1) events = [];
       if (changes.fdFeedEnabled) loginPromptDismissed = false;
       publishSetting();
       if (settings.fdFeedEnabled) poll(true);
